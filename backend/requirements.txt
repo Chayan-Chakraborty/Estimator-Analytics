@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+qdrant-client
+pydantic
+sentence-transformers
+python-multipart
+sqlalchemy
+mysql-connector-python
+python-dotenv
