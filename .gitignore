@@ -1,0 +1,45 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# AI / ML / Data files
+*.h5
+*.pt
+*.ckpt
+*.model
+*.pkl
+*.joblib
+*.weights
+*.onnx
+*.bin
+*.data
+*.dataset/
+*.cache/
+__pycache__/
+.ipynb_checkpoints/
+
+# Build / dist
+dist/
+build/
+coverage/
