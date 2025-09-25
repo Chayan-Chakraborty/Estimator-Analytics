@@ -1,5 +1,6 @@
 from sentence_transformers import SentenceTransformer
 from app.qdrant_client_helper import client, create_collection, COLLECTION_NAME
+from app.amount_calculator import AmountCalculatorUtils
 import mysql.connector
 import os
 from uuid import uuid4
@@ -133,6 +134,31 @@ def ingest_to_qdrant():
         parsed_attrs = parse_item_attributes(attributes)
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
+
+        # Calculate amount if missing/null using AmountCalculatorUtils
+        amount_to_store = amount
+        try:
+            if not amount_to_store or amount_to_store == 0:
+                type_identifier = None
+                if isinstance(item_identifier, str):
+                    if "WD" in item_identifier:
+                        type_identifier = "WD"
+                    elif "FC" in item_identifier:
+                        type_identifier = "FC"
+                    elif "ACS" in item_identifier:
+                        type_identifier = "ACS"
+                    elif "LF" in item_identifier:
+                        type_identifier = "LF"
+                    elif "OTH" in item_identifier:
+                        type_identifier = "OTH"
+                if type_identifier:
+                    dummy_item = type("Item", (), {"attributes": attributes})()
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    if calculated_amount and calculated_amount > 0:
+                        amount_to_store = calculated_amount
+        except Exception:
+            # Swallow calculation errors and fall back to original amount
+            pass
         client.upsert(
             collection_name=COLLECTION_NAME,
             points=[
@@ -143,7 +169,7 @@ def ingest_to_qdrant():
                         "estimator_id": estimator_id,
                         "room_name": room_name,
                         "item_name": item_name,
-                        "amount": amount,
+                        "amount": amount_to_store,
                         "area": area,
                         "project_name": project_name,
                         "attributes": attributes,

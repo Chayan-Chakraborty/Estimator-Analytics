@@ -328,27 +328,133 @@ def search_with_nlp(data: NLPSearchQuery):
 def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
     """
     Get filtered statistics.
-    - Groups similar city names (e.g. Bangalore/Bengaluru/Bangalor).
-    - Shows measurement_sqft range (min-max) for each city group.
-    - Returns stats for all cities if no city is provided.
+
+    - Queries Qdrant without filters
+    - Automatically clusters similar city names using SequenceMatcher
+    - Returns only:
+        * city/cluster name
+        * average amount across the cluster
+        * total count
     """
+
     print(f"DEBUG: Received data: {data}")
 
-    # ---------------------------
-    # 1️⃣ Build Qdrant filters
-    # ---------------------------
+    # 1️⃣ Fetch all items from Qdrant (ignore filters)
+    result = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=None,
+        limit=10000
+    )
+
+    items: List[Dict[str, Any]] = []
+    for point in result[0]:
+        item = point.payload.copy()
+
+        # Calculate amount if missing
+        if not item.get("amount") or item.get("amount") == 0:
+            calculated_amount = calculate_amount_from_attributes(item)
+            if calculated_amount > 0:
+                item["amount"] = calculated_amount
+
+        items.append(item)
+
+    # 2️⃣ Helper to normalize and canonicalize raw area names
+    def canonicalize_city(name: str) -> str:
+        raw = (name or "unknown").strip().lower()
+        return re.sub(r"[^a-z]", "", raw) or "unknown"
+
+    # 3️⃣ Build list of unique normalized city names
+    unique_areas = sorted({canonicalize_city(i.get("area")) for i in items})
+
+    # 4️⃣ Build clusters of similar city names dynamically
+    def build_clusters(areas: List[str], threshold: float = 0.8) -> Dict[str, List[str]]:
+        """
+        Group similar names together if their SequenceMatcher ratio >= threshold.
+        Returns dict: {cluster_representative: [members]}
+        """
+        clusters: Dict[str, List[str]] = {}
+        assigned: set[str] = set()
+
+        for area in areas:
+            if area in assigned:
+                continue
+
+            # start a new cluster
+            clusters[area] = [area]
+            assigned.add(area)
+
+            for other in areas:
+                if other in assigned:
+                    continue
+                if SequenceMatcher(None, area, other).ratio() >= threshold:
+                    clusters[area].append(other)
+                    assigned.add(other)
+
+        return clusters
+
+    clusters = build_clusters(unique_areas, threshold=0.8)
+
+    # Reverse lookup: member → cluster representative
+    member_to_cluster = {
+        member: representative
+        for representative, members in clusters.items()
+        for member in members
+    }
+
+    # 5️⃣ Aggregate avg amount & count by cluster
+    from collections import defaultdict
+
+    merged_stats = defaultdict(lambda: {"area": "", "amounts": [], "count": 0})
+
+    for item in items:
+        norm_area = canonicalize_city(item.get("area"))
+        cluster_rep = member_to_cluster.get(norm_area, norm_area)
+
+        try:
+            amount = float(item.get("amount") or 0)
+        except (ValueError, TypeError):
+            amount = 0
+
+        ms = merged_stats[cluster_rep]
+        if not ms["area"]:
+            ms["area"] = cluster_rep
+        ms["amounts"].append(amount)
+        ms["count"] += 1
+
+    # 6️⃣ Final list: only cluster name, avg amount, and total count
+    final_area_stats: List[Dict[str, Any]] = []
+    for g in merged_stats.values():
+        valid_amounts = [a for a in g["amounts"] if isinstance(a, (int, float))]
+        if not valid_amounts:
+            continue
+        final_area_stats.append({
+            "area": g["area"],
+            "avg": sum(valid_amounts) / len(valid_amounts),
+            "count": g["count"]
+        })
+
+    final_area_stats.sort(key=lambda x: x["area"])
+
+    return {"results": items, "area_stats": final_area_stats}
+
+
+@app.post("/search/filtered-stats/only")
+def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
+    """
+    Same as /search/filtered-stats but returns only area_stats.
+    """
+    # Build filters (same as filtered-stats)
     filters: List[FieldCondition] = []
     try:
         data_dict = data.dict() if hasattr(data, "dict") else data.__dict__
-        print(f"DEBUG: data_dict = {data_dict}")
 
         if data_dict.get("item_name"):
             filters.append(FieldCondition(
-                key="item_name", match=MatchValue(value=data_dict["item_name"])
+                key="item_name", match=MatchValue(value=data_dict["item_name"]) 
             ))
         if data_dict.get("city"):
             filters.append(FieldCondition(
-                key="area", match=MatchValue(value=data_dict["city"])
+                key="area", match=MatchValue(value=data_dict["city"]) 
             ))
         measurement_min = data_dict.get("measurement_min")
         measurement_max = data_dict.get("measurement_max")
@@ -361,100 +467,93 @@ def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
             filters.append(FieldCondition(
                 key="measurement_sqft", range=Range(**r)))
     except Exception as e:
-        print(f"DEBUG: Error building filters: {e}")
+        print(f"DEBUG: Error building filters (only): {e}")
 
     filter_obj = Filter(must=filters) if filters else None
 
-    # ---------------------------
-    # 2️⃣ Query Qdrant
-    # ---------------------------
+    # Query Qdrant
     result = client.scroll(
         collection_name=COLLECTION_NAME,
         scroll_filter=filter_obj,
         limit=10000
     )
 
-    # ---------------------------
-    # 3️⃣ Collect items and calculate amount
-    # ---------------------------
+    # Collect minimal data for stats
     items: List[Dict[str, Any]] = []
     for point in result[0]:
-        item = point.payload.copy()
-        if not item.get("amount") or item.get("amount") == 0:
-            calculated_amount = calculate_amount_from_attributes(item)
-            if calculated_amount > 0:
-                item["amount"] = calculated_amount
-        items.append(item)
+        items.append(point.payload.copy())
 
-    # ---------------------------
-    # 4️⃣ Helpers
-    # ---------------------------
+    # Helpers
     def normalize_city(name: str) -> str:
         return (name or "unknown").strip().lower()
-
+    
     def similar(a: str, b: str) -> bool:
         return SequenceMatcher(None, a, b).ratio() > 0.8
 
     selected_city = (data.city or "").strip().lower()
 
-    # Determine which city names to include
+    # Build canonical clusters of similar-spelled city names
+    all_norm_areas = sorted({normalize_city(i.get("area") or "unknown") for i in items})
+    clusters: Dict[str, List[str]] = {}
+    assigned: Dict[str, str] = {}
+    for area in all_norm_areas:
+        if area in assigned:
+            continue
+        clusters[area] = []
+        for other in all_norm_areas:
+            if other in assigned:
+                continue
+            if similar(area, other):
+                clusters[area].append(other)
+                assigned[other] = area
+    norm_to_canonical: Dict[str, str] = {member: canon for canon, members in clusters.items() for member in members}
+
+    # If a city is selected, restrict to clusters similar to it
+    allowed_norms: Optional[set] = None
     if selected_city:
         target = normalize_city(selected_city)
-        city_variants = {
-            normalize_city(i.get("area") or "unknown")
-            for i in items
-            if similar(normalize_city(i.get("area") or "unknown"), target)
-        }
-    else:
-        # No city given → include all normalized city names
-        city_variants = {
-            normalize_city(i.get("area") or "unknown")
-            for i in items
-        }
+        allowed_canons = {canon for canon in clusters.keys() if similar(canon, target)}
+        allowed_norms = set()
+        for canon in allowed_canons:
+            for member in clusters.get(canon, []):
+                allowed_norms.add(member)
 
-    # ---------------------------
-    # 5️⃣ Group stats by normalized city
-    # ---------------------------
+    # Group stats by normalized city
     grouped_stats: Dict[str, Dict[str, Any]] = {}
     for item in items:
         raw_area = item.get("area") or "unknown"
         norm_area = normalize_city(raw_area)
-        if norm_area not in city_variants:
+        if allowed_norms is not None and norm_area not in allowed_norms:
             continue
+        canonical_area = norm_to_canonical.get(norm_area, norm_area)
 
-        # Amount
         try:
             amount = float(item.get("amount") or 0)
         except (ValueError, TypeError):
             amount = 0
 
-        # Measurement
         try:
             measurement = float(item.get("measurement_sqft")) if item.get(
                 "measurement_sqft") is not None else None
         except (ValueError, TypeError):
             measurement = None
 
-        if norm_area not in grouped_stats:
-            grouped_stats[norm_area] = {
-                "area": norm_area,
+        if canonical_area not in grouped_stats:
+            grouped_stats[canonical_area] = {
+                "area": canonical_area,
                 "amounts": [],
                 "measurements": [],
                 "count": 0
             }
-
-        grouped_stats[norm_area]["amounts"].append(amount)
+        grouped_stats[canonical_area]["amounts"].append(amount)
         if measurement is not None:
-            grouped_stats[norm_area]["measurements"].append(measurement)
-        grouped_stats[norm_area]["count"] += 1
+            grouped_stats[canonical_area]["measurements"].append(measurement)
+        grouped_stats[canonical_area]["count"] += 1
 
-    # ---------------------------
-    # 6️⃣ Build area_stats
-    # ---------------------------
+    # Build area_stats only
     area_stats = []
     for g in grouped_stats.values():
-        valid_amounts = [a for a in g["amounts"]
-                         if isinstance(a, (int, float))]
+        valid_amounts = [a for a in g["amounts"] if isinstance(a, (int, float))]
         if not valid_amounts:
             continue
 
@@ -475,7 +574,7 @@ def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
 
     area_stats.sort(key=lambda x: x["area"])
 
-    return {"results": items, "area_stats": area_stats}
+    return {"area_stats": area_stats}
 
 
 @app.post("/test-filtered-stats")

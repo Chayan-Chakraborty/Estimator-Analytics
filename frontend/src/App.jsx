@@ -16,6 +16,7 @@ function App() {
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState("");
   const [areaAmountStats, setAreaAmountStats] = useState([]); // [{ area, min, max, avg }]
+  const [areaStatsAvg, setAreaStatsAvg] = useState(null);
 
   // Sidebar filter states
   const [filters, setFilters] = useState({
@@ -122,39 +123,22 @@ function App() {
     }
   }, []);
 
-  // Perform search
+  // Perform search using NLP endpoint
   const handleSearch = async (newPage = page) => {
-    if (!query.trim()) return;
     setIsSearching(true);
     setError("");
-    // Clear results to avoid visual accumulation while loading next page
     setResults([]);
+    setAreaAmountStats([]);
+    setAreaStatsAvg(null);
     try {
-      let res;
-      if (useNLP) {
-        // Use NLP-based search
-        res = await axios.post(`${BACKEND_URL}/search/nlp`, {
-          query,
-          use_nlp: true
-        });
-        
-        // Update extracted filters for display
-        if (res.data.extracted_filters) {
-          setExtractedFilters(res.data.extracted_filters);
-        }
-      } else {
-        // Use regular search
-        res = await axios.post(`${BACKEND_URL}/search`, {
-          query,
-          page: newPage,
-          page_size: pageSize
-        });
-      }
+      const res = await axios.post(`${BACKEND_URL}/search/nlp`, {
+        query,
+        use_nlp: true
+      });
 
       const raw = res?.data?.results;
       const safeArray = Array.isArray(raw) ? raw : [];
 
-      // Normalize each item and defensively compute fields
       const normalized = safeArray.map((item) => {
         const measurementSqft = toSafeNumber(item?.measurement_sqft);
         const fallbackMeasurement = (() => {
@@ -174,6 +158,8 @@ function App() {
 
       setResults(normalized);
       setPage(newPage);
+
+      // /search/nlp does not return area_stats
     } catch (e) {
       const message = e?.response?.data?.detail || e?.message || 'Unknown error';
       setError(`Failed to fetch results: ${message}`);
@@ -198,7 +184,7 @@ function App() {
           amount_min: filters.amountMin ? parseFloat(filters.amountMin) : null,
           amount_max: filters.amountMax ? parseFloat(filters.amountMax) : null
         });
-        
+
         const areaStats = res?.data?.area_stats || [];
         setAreaAmountStats(areaStats);
       } catch (e) {
@@ -250,7 +236,7 @@ function App() {
     setIsFiltering(true);
     setError("");
     try {
-      const res = await axios.post(`${BACKEND_URL}/search/filtered-stats`, {
+      const res = await axios.post(`${BACKEND_URL}/search/filtered-stats/only`, {
         item_name: filters.itemName || null,
         city: filters.city || null,
         measurement_min: filters.measurementMin ? parseFloat(filters.measurementMin) : null,
@@ -258,8 +244,11 @@ function App() {
         amount_min: filters.amountMin ? parseFloat(filters.amountMin) : null,
         amount_max: filters.amountMax ? parseFloat(filters.amountMax) : null
       });
-      
-      setFilteredResults(res?.data?.results || []);
+      // New endpoint returns only area_stats
+      setFilteredResults([]);
+      const areaStats = res?.data?.area_stats || [];
+      setAreaAmountStats(areaStats);
+      setAreaStatsAvg(areaStats.length > 0 && typeof areaStats[0].avg === 'number' ? areaStats[0].avg : null);
     } catch (e) {
       const message = e?.response?.data?.detail || e?.message || 'Unknown error';
       setError(`Failed to apply filters: ${message}`);
@@ -278,6 +267,8 @@ function App() {
       amountMax: ""
     });
     setFilteredResults([]);
+    setAreaAmountStats([]);
+    setAreaStatsAvg(null);
   };
 
   const buttonStyle = {
@@ -311,20 +302,20 @@ function App() {
           <h2 style={{ margin: 0 }}>Estimator Item Search</h2>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button 
-            onClick={() => setUseNLP(!useNLP)} 
+          <button
+            onClick={() => setUseNLP(!useNLP)}
             style={{ ...buttonStyle, background: useNLP ? "#7c3aed" : "#6b7280" }}
           >
             {useNLP ? "NLP ON" : "NLP OFF"}
           </button>
-          <button 
-            onClick={() => setShowSidebar(!showSidebar)} 
+          <button
+            onClick={() => setShowSidebar(!showSidebar)}
             style={{ ...buttonStyle, background: showSidebar ? "#dc2626" : "#111827" }}
           >
             {showSidebar ? "Hide Filters" : "Show Filters"}
           </button>
-          <button 
-            onClick={() => setViewMode(viewMode === "cards" ? "table" : "cards")} 
+          <button
+            onClick={() => setViewMode(viewMode === "cards" ? "table" : "cards")}
             style={{ ...buttonStyle, background: "#059669" }}
           >
             {viewMode === "cards" ? "Table View" : "Card View"}
@@ -352,7 +343,7 @@ function App() {
           marginTop: "73px"
         }}>
           <h3 style={{ margin: "0 0 16px 0" }}>Filters</h3>
-          
+
           {/* NLP Examples */}
           {useNLP && (
             <div style={{ marginBottom: 16, padding: 12, background: "#f0f9ff", borderRadius: 6, border: "1px solid #0ea5e9" }}>
@@ -360,14 +351,14 @@ function App() {
                 💡 NLP Examples:
               </div>
               <div style={{ fontSize: 11, color: "#0369a1", lineHeight: 1.4 }}>
-                • "TV Wall Unit in Bangalore"<br/>
-                • "between 50-100 sqft"<br/>
-                • "under ₹50000"<br/>
+                • "TV Wall Unit in Bangalore"<br />
+                • "between 50-100 sqft"<br />
+                • "under ₹50000"<br />
                 • "Console Table from Mumbai"
               </div>
             </div>
           )}
-          
+
           {/* Item Name Filter */}
           <div style={{ marginBottom: 16 }}>
             <label style={{ display: "block", marginBottom: 4, fontWeight: 500 }}>Item Name</label>
@@ -505,10 +496,12 @@ function App() {
             </button>
           </div>
 
-          {/* Filtered Results Count */}
-          {filteredResults.length > 0 && (
+          {/* Area Stats Average Value */}
+          {areaAmountStats.length > 0 && (
             <div style={{ marginTop: 16, padding: 12, background: "#f3f4f6", borderRadius: 6 }}>
-              <div style={{ fontSize: 14, fontWeight: 500 }}>Filtered Results: {filteredResults.length}</div>
+              <div style={{ fontSize: 14, fontWeight: 500 }}>
+                Area Stats Avg: ₹{areaAmountStats[0]?.avg ? areaAmountStats[0].avg.toLocaleString(undefined, { maximumFractionDigits: 2 }) : 0}
+              </div>
             </div>
           )}
         </div>
@@ -523,7 +516,8 @@ function App() {
           borderRadius: 999,
           padding: "8px 12px",
           margin: "16px auto",
-          maxWidth: 640
+          maxWidth: 640,
+          gap: 8
         }}>
           <input
             type="text"
@@ -553,6 +547,21 @@ function App() {
             {isSearching ? "Searching..." : "Search"}
           </button>
         </div>
+
+        {/* Area Stats Avg display near search bar
+        {areaStatsAvg !== null && (
+          <div style={{
+            background: "#f3f4f6",
+            border: "1px solid #e5e7eb",
+            padding: 10,
+            borderRadius: 8,
+            margin: "0 auto 8px",
+            maxWidth: 640,
+            color: "#111827"
+          }}>
+            Area Stats Avg: ₹{Number(areaStatsAvg).toFixed(2)}
+          </div>
+        )} */}
 
         {/* Extracted Filters Display */}
         {useNLP && Object.keys(extractedFilters).length > 0 && (
@@ -649,24 +658,24 @@ function App() {
 
               return (
                 <div key={key}
-                     style={{
-                       border: "1px solid #e5e7eb",
-                       padding: 12,
-                       borderRadius: 8,
-                       background: "#fff",
-                       boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-                       cursor: "pointer"
-                     }}
-                     onClick={() => setSelectedItem(item)}>
+                  style={{
+                    border: "1px solid #e5e7eb",
+                    padding: 12,
+                    borderRadius: 8,
+                    background: "#fff",
+                    boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+                    cursor: "pointer"
+                  }}
+                  onClick={() => setSelectedItem(item)}>
                   {imgUrl && (
                     <img src={imgUrl} alt={item.item_name}
-                         style={{
-                           width: "100%",
-                           height: 160,
-                           objectFit: "cover",
-                           borderRadius: 6,
-                           background: "#f3f4f6"
-                         }} />
+                      style={{
+                        width: "100%",
+                        height: 160,
+                        objectFit: "cover",
+                        borderRadius: 6,
+                        background: "#f3f4f6"
+                      }} />
                   )}
                   {item.item_name && (
                     <h3 style={{ margin: "10px 0 4px", fontSize: 16 }}>{item.item_name}</h3>
@@ -732,12 +741,12 @@ function App() {
                     const sqft = toSafeNumber(item.measurement_sqft);
                     const amountNum = toSafeNumber(item.amount);
                     const avgPerSqft = sqft && sqft > 0 && amountNum != null ? (amountNum / sqft) : null;
-                    
+
                     return (
-                      <tr 
+                      <tr
                         key={item.item_identifier || item.id || item.item_name || index}
-                        style={{ 
-                          borderBottom: "1px solid #f3f4f6", 
+                        style={{
+                          borderBottom: "1px solid #f3f4f6",
                           cursor: "pointer",
                           transition: "background-color 0.2s"
                         }}
@@ -747,22 +756,22 @@ function App() {
                       >
                         <td style={{ padding: "12px 16px" }}>
                           {imgUrl ? (
-                            <img 
-                              src={imgUrl} 
-                              alt={item.item_name} 
-                              style={{ 
-                                width: 40, 
-                                height: 40, 
-                                objectFit: "cover", 
+                            <img
+                              src={imgUrl}
+                              alt={item.item_name}
+                              style={{
+                                width: 40,
+                                height: 40,
+                                objectFit: "cover",
                                 borderRadius: 4,
                                 background: "#f3f4f6"
-                              }} 
+                              }}
                             />
                           ) : (
-                            <div style={{ 
-                              width: 40, 
-                              height: 40, 
-                              background: "#f3f4f6", 
+                            <div style={{
+                              width: 40,
+                              height: 40,
+                              background: "#f3f4f6",
                               borderRadius: 4,
                               display: "flex",
                               alignItems: "center",
@@ -847,7 +856,7 @@ function App() {
                 const imgUrl = extractImageUrl(selectedItem.image);
                 return imgUrl ? (
                   <img src={imgUrl} alt={selectedItem.item_name}
-                       style={{ width: "100%", height: 180, objectFit: "cover", borderRadius: 8 }} />
+                    style={{ width: "100%", height: 180, objectFit: "cover", borderRadius: 8 }} />
                 ) : null;
               })()}
               <div style={{ marginTop: 10 }}>
