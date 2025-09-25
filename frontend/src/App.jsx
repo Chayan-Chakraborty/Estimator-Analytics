@@ -22,10 +22,7 @@ function App() {
   const [filters, setFilters] = useState({
     itemName: "",
     city: "",
-    measurementMin: "",
-    measurementMax: "",
-    amountMin: "",
-    amountMax: ""
+    measurement: ""
   });
   const [showSidebar, setShowSidebar] = useState(false);
   const [filteredResults, setFilteredResults] = useState([]);
@@ -60,6 +57,24 @@ function App() {
     if (typeof val === 'number') return val;
     if (typeof val === 'string' && val.trim() !== '' && !isNaN(Number(val))) return Number(val);
     return null;
+  };
+
+  // Calculate avg amount for same city and item_name
+  const calculateAvgAmount = (currentItem, allItems) => {
+    const sameCityItemName = allItems.filter(item => 
+      item.area === currentItem.area && 
+      item.item_name === currentItem.item_name
+    );
+    
+    if (sameCityItemName.length <= 1) return null;
+    
+    const amounts = sameCityItemName
+      .map(item => toSafeNumber(item.amount))
+      .filter(amount => amount !== null && amount > 0);
+    
+    if (amounts.length === 0) return null;
+    
+    return amounts.reduce((sum, amount) => sum + amount, 0) / amounts.length;
   };
 
   const buildParsedAttributes = (rawAttributes, fallbackMeasurement) => {
@@ -123,7 +138,7 @@ function App() {
     }
   }, []);
 
-  // Perform search using NLP endpoint
+  // Perform search using NLP or Vector endpoint based on toggle
   const handleSearch = async (newPage = page) => {
     setIsSearching(true);
     setError("");
@@ -131,9 +146,11 @@ function App() {
     setAreaAmountStats([]);
     setAreaStatsAvg(null);
     try {
-      const res = await axios.post(`${BACKEND_URL}/search/nlp`, {
+      // Use different endpoints based on NLP toggle
+      const endpoint = useNLP ? '/search/nlp' : '/search/vector';
+      const res = await axios.post(`${BACKEND_URL}${endpoint}`, {
         query,
-        use_nlp: true
+        use_nlp: useNLP
       });
 
       const raw = res?.data?.results;
@@ -179,10 +196,6 @@ function App() {
         const res = await axios.post(`${BACKEND_URL}/search/filtered-stats`, {
           item_name: selectedItem.item_name,
           city: filters.city || null,
-          measurement_min: filters.measurementMin ? parseFloat(filters.measurementMin) : null,
-          measurement_max: filters.measurementMax ? parseFloat(filters.measurementMax) : null,
-          amount_min: filters.amountMin ? parseFloat(filters.amountMin) : null,
-          amount_max: filters.amountMax ? parseFloat(filters.amountMax) : null
         });
 
         const areaStats = res?.data?.area_stats || [];
@@ -238,11 +251,7 @@ function App() {
     try {
       const res = await axios.post(`${BACKEND_URL}/search/filtered-stats/only`, {
         item_name: filters.itemName || null,
-        city: filters.city || null,
-        measurement_min: filters.measurementMin ? parseFloat(filters.measurementMin) : null,
-        measurement_max: filters.measurementMax ? parseFloat(filters.measurementMax) : null,
-        amount_min: filters.amountMin ? parseFloat(filters.amountMin) : null,
-        amount_max: filters.amountMax ? parseFloat(filters.amountMax) : null
+        city: filters.city || null
       });
       // New endpoint returns only area_stats
       setFilteredResults([]);
@@ -261,10 +270,7 @@ function App() {
     setFilters({
       itemName: "",
       city: "",
-      measurementMin: "",
-      measurementMax: "",
-      amountMin: "",
-      amountMax: ""
+      measurement: ""
     });
     setFilteredResults([]);
     setAreaAmountStats([]);
@@ -295,7 +301,12 @@ function App() {
         position: "sticky",
         top: 0,
         background: "#ffffff",
-        zIndex: 10
+        zIndex: 10,
+        "@media (max-width: 768px)": {
+          padding: "12px 16px",
+          flexWrap: "wrap",
+          gap: 8
+        }
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 28, height: 28, background: "#111827", borderRadius: 6 }} />
@@ -305,8 +316,9 @@ function App() {
           <button
             onClick={() => setUseNLP(!useNLP)}
             style={{ ...buttonStyle, background: useNLP ? "#7c3aed" : "#6b7280" }}
+            title={useNLP ? "NLP Mode: Extracts filters from natural language" : "Vector Mode: Pure semantic similarity search"}
           >
-            {useNLP ? "NLP ON" : "NLP OFF"}
+            {useNLP ? "NLP Mode" : "Vector Mode"}
           </button>
           <button
             onClick={() => setShowSidebar(!showSidebar)}
@@ -340,24 +352,42 @@ function App() {
           padding: 16,
           overflowY: "auto",
           zIndex: 20,
-          marginTop: "73px"
+          marginTop: "73px",
+          "@media (max-width: 1024px)": {
+            width: "300px"
+          },
+          "@media (max-width: 768px)": {
+            width: "100vw",
+            height: "100vh",
+            marginTop: 0,
+            zIndex: 30
+          }
         }}>
           <h3 style={{ margin: "0 0 16px 0" }}>Filters</h3>
 
-          {/* NLP Examples */}
-          {useNLP && (
-            <div style={{ marginBottom: 16, padding: 12, background: "#f0f9ff", borderRadius: 6, border: "1px solid #0ea5e9" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#0369a1", marginBottom: 8 }}>
-                💡 NLP Examples:
-              </div>
-              <div style={{ fontSize: 11, color: "#0369a1", lineHeight: 1.4 }}>
-                • "TV Wall Unit in Bangalore"<br />
-                • "between 50-100 sqft"<br />
-                • "under ₹50000"<br />
-                • "Console Table from Mumbai"
-              </div>
+          {/* Search Mode Examples */}
+          <div style={{ marginBottom: 16, padding: 12, background: useNLP ? "#f0f9ff" : "#f0fdf4", borderRadius: 6, border: `1px solid ${useNLP ? "#0ea5e9" : "#22c55e"}` }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: useNLP ? "#0369a1" : "#15803d", marginBottom: 8 }}>
+              {useNLP ? "💡 NLP Mode Examples:" : "🔍 Vector Mode Examples:"}
             </div>
-          )}
+            <div style={{ fontSize: 11, color: useNLP ? "#0369a1" : "#15803d", lineHeight: 1.4 }}>
+              {useNLP ? (
+                <>
+                  • "TV Wall Unit in Bangalore"<br />
+                  • "between 50-100 sqft"<br />
+                  • "under ₹50000"<br />
+                  • "Console Table from Mumbai"
+                </>
+              ) : (
+                <>
+                  • "wooden furniture"<br />
+                  • "modern table design"<br />
+                  • "bedroom storage"<br />
+                  • "dining room furniture"
+                </>
+              )}
+            </div>
+          </div>
 
           {/* Item Name Filter */}
           <div style={{ marginBottom: 16 }}>
@@ -395,78 +425,25 @@ function App() {
             />
           </div>
 
-          {/* Measurement Range */}
+          {/* Measurement Single Input */}
           <div style={{ marginBottom: 16 }}>
             <label style={{ display: "block", marginBottom: 4, fontWeight: 500 }}>Measurement (sqft)</label>
-            <div style={{ display: "flex", gap: 8 }}>
-              <input
-                type="number"
-                placeholder={useNLP ? "Min" : "Min"}
-                value={filters.measurementMin}
-                onChange={(e) => handleFilterChange('measurementMin', e.target.value)}
-                style={{
-                  flex: 1,
-                  padding: "8px 12px",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 6,
-                  fontSize: 14
-                }}
-              />
-              <input
-                type="number"
-                placeholder={useNLP ? "Max" : "Max"}
-                value={filters.measurementMax}
-                onChange={(e) => handleFilterChange('measurementMax', e.target.value)}
-                style={{
-                  flex: 1,
-                  padding: "8px 12px",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 6,
-                  fontSize: 14
-                }}
-              />
-            </div>
+            <input
+              type="text"
+              placeholder={useNLP ? "e.g., 120 or 50-100" : "Enter sqft or range (50-100)"}
+              value={filters.measurement}
+              onChange={(e) => handleFilterChange('measurement', e.target.value)}
+              style={{
+                width: "100%",
+                padding: "8px 12px",
+                border: "1px solid #e5e7eb",
+                borderRadius: 6,
+                fontSize: 14
+              }}
+            />
             {useNLP && (
               <div style={{ fontSize: 11, color: "#6b7280", marginTop: 4 }}>
-                Try: "between 50-100 sqft" or "over 200 sqft"
-              </div>
-            )}
-          </div>
-
-          {/* Amount Range */}
-          <div style={{ marginBottom: 16 }}>
-            <label style={{ display: "block", marginBottom: 4, fontWeight: 500 }}>Amount</label>
-            <div style={{ display: "flex", gap: 8 }}>
-              <input
-                type="number"
-                placeholder={useNLP ? "Min" : "Min"}
-                value={filters.amountMin}
-                onChange={(e) => handleFilterChange('amountMin', e.target.value)}
-                style={{
-                  flex: 1,
-                  padding: "8px 12px",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 6,
-                  fontSize: 14
-                }}
-              />
-              <input
-                type="number"
-                placeholder={useNLP ? "Max" : "Max"}
-                value={filters.amountMax}
-                onChange={(e) => handleFilterChange('amountMax', e.target.value)}
-                style={{
-                  flex: 1,
-                  padding: "8px 12px",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 6,
-                  fontSize: 14
-                }}
-              />
-            </div>
-            {useNLP && (
-              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 4 }}>
-                Try: "under ₹50000" or "between ₹10000-50000"
+                Try: "50-100 sqft" or "200 sqft"
               </div>
             )}
           </div>
@@ -507,7 +484,20 @@ function App() {
         </div>
       )}
 
-      <div style={{ maxWidth: 960, margin: "0 auto", padding: "0 16px", marginLeft: showSidebar ? "336px" : "auto" }}>
+      <div style={{ 
+        maxWidth: 960, 
+        margin: "0 auto", 
+        padding: "0 16px", 
+        marginLeft: showSidebar ? "336px" : "auto",
+        transition: "margin-left 0.3s ease",
+        "@media (max-width: 1024px)": {
+          marginLeft: showSidebar ? "320px" : "auto"
+        },
+        "@media (max-width: 768px)": {
+          marginLeft: "auto",
+          padding: "0 12px"
+        }
+      }}>
         {/* Search bar */}
         <div style={{
           display: "flex",
@@ -517,11 +507,16 @@ function App() {
           padding: "8px 12px",
           margin: "16px auto",
           maxWidth: 640,
-          gap: 8
+          gap: 8,
+          "@media (max-width: 768px)": {
+            margin: "12px auto",
+            padding: "6px 10px",
+            gap: 6
+          }
         }}>
           <input
             type="text"
-            placeholder={useNLP ? "Try: 'TV Wall Unit in Bangalore between 50-100 sqft under ₹50000'" : "Search items with natural language..."}
+            placeholder={useNLP ? "Try: 'TV Wall Unit in Bangalore between 50-100 sqft under ₹50000'" : "Search items with semantic similarity..."}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(1); }}
@@ -643,8 +638,12 @@ function App() {
           <div style={{
             marginTop: 12,
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-            gap: 12
+            gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+            gap: 16,
+            "@media (max-width: 768px)": {
+              gridTemplateColumns: "1fr",
+              gap: 12
+            }
           }}>
             {(filteredResults.length > 0 ? filteredResults : results).map((item) => {
               const key = item.item_identifier || item.id || item.item_name;
@@ -653,6 +652,7 @@ function App() {
               const amountNum = toSafeNumber(item.amount);
               const avgPerSqft = sqft && sqft > 0 && amountNum != null ? (amountNum / sqft) : null;
               const subtitleParts = [item.room_name, item.project_name, item.area].filter(Boolean);
+              const avgAmount = calculateAvgAmount(item, filteredResults.length > 0 ? filteredResults : results);
 
               const attrs = item.attributes_parsed && typeof item.attributes_parsed === 'object' ? item.attributes_parsed : {};
 
@@ -660,57 +660,81 @@ function App() {
                 <div key={key}
                   style={{
                     border: "1px solid #e5e7eb",
-                    padding: 12,
+                    padding: 16,
                     borderRadius: 8,
                     background: "#fff",
-                    boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-                    cursor: "pointer"
+                    boxShadow: "0 1px 3px rgba(0,0,0,0.1)",
+                    cursor: "pointer",
+                    transition: "transform 0.2s, box-shadow 0.2s",
+                    minHeight: "320px",
+                    display: "flex",
+                    flexDirection: "column"
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = "translateY(-2px)";
+                    e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.15)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = "0 1px 3px rgba(0,0,0,0.1)";
                   }}
                   onClick={() => setSelectedItem(item)}>
                   {imgUrl && (
                     <img src={imgUrl} alt={item.item_name}
                       style={{
                         width: "100%",
-                        height: 160,
+                        height: 180,
                         objectFit: "cover",
                         borderRadius: 6,
-                        background: "#f3f4f6"
+                        background: "#f3f4f6",
+                        marginBottom: 12
                       }} />
                   )}
                   {item.item_name && (
-                    <h3 style={{ margin: "10px 0 4px", fontSize: 16 }}>{item.item_name}</h3>
+                    <h3 style={{ margin: "0 0 8px 0", fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>{item.item_name}</h3>
                   )}
                   {subtitleParts.length > 0 && (
-                    <p style={{ color: "#6b7280", fontSize: 13 }}>{subtitleParts.join(" • ")}</p>
+                    <p style={{ color: "#6b7280", fontSize: 13, margin: "0 0 12px 0", lineHeight: 1.4 }}>{subtitleParts.join(" • ")}</p>
                   )}
                   {/* Card details table - only show rows that exist */}
-                  <div style={{ marginTop: 6 }}>
+                  <div style={{ marginTop: "auto", paddingTop: 8 }}>
                     {item.amount !== undefined && item.amount !== null && item.amount !== '' && (
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
                         <span style={{ color: "#6b7280" }}>Amount</span>
-                        <span style={{ fontWeight: 600, color: "#059669" }}>₹{item.amount}</span>
+                        <span style={{ fontWeight: 600, color: "#059669" }}>₹{Number(item.amount).toFixed(2)}</span>
+                      </div>
+                    )}
+                    {avgAmount !== null && (
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6, padding: "6px 8px", background: "#f0f9ff", borderRadius: 4 }}>
+                        <span style={{ color: "#0369a1", fontWeight: 500 }}>Average Price in {item.area}</span>
+                        <span style={{ fontWeight: 600, color: "#0369a1" }}>₹{avgAmount.toFixed(2)}</span>
                       </div>
                     )}
                     {sqft && sqft > 0 && (
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginTop: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
                         <span style={{ color: "#6b7280" }}>Measurement (sqft)</span>
                         <span>{sqft.toFixed(2)}</span>
                       </div>
                     )}
                     {avgPerSqft !== null && (
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginTop: 4 }}>
-                        <span style={{ color: "#6b7280" }}>Avg/ft²</span>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
+                        <span style={{ color: "#6b7280" }}>Average Price/ft²</span>
                         <span>₹{avgPerSqft.toFixed(2)}</span>
                       </div>
                     )}
                     {Object.keys(attrs).length > 0 && (
-                      <div style={{ marginTop: 6 }}>
-                        {Object.entries(attrs).map(([k, v]) => (
-                          <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginTop: 2 }}>
+                      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #f3f4f6" }}>
+                        {Object.entries(attrs).slice(0, 3).map(([k, v]) => (
+                          <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
                             <span style={{ color: "#6b7280" }}>{k}</span>
-                            <span style={{ color: "#111827" }}>{String(v)}</span>
+                            <span style={{ color: "#111827", fontWeight: 500 }}>{String(v)}</span>
                           </div>
                         ))}
+                        {Object.keys(attrs).length > 3 && (
+                          <div style={{ fontSize: 11, color: "#9ca3af", textAlign: "center", marginTop: 4 }}>
+                            +{Object.keys(attrs).length - 3} more attributes
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -720,8 +744,15 @@ function App() {
           </div>
         ) : (
           /* Table View */
-          <div style={{ marginTop: 12, background: "#fff", borderRadius: 8, overflow: "hidden", border: "1px solid #e5e7eb" }}>
-            <div style={{ overflowX: "auto" }}>
+          <div style={{ 
+            marginTop: 12, 
+            background: "#fff", 
+            borderRadius: 8, 
+            overflow: "hidden", 
+            border: "1px solid #e5e7eb",
+            overflowX: "auto"
+          }}>
+            <div style={{ minWidth: "800px" }}>
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead>
                   <tr style={{ background: "#f9fafb", borderBottom: "1px solid #e5e7eb" }}>
@@ -893,21 +924,30 @@ function App() {
                   <div style={{ marginTop: 8 }}>
                     <div style={{
                       display: "grid",
-                      gridTemplateColumns: "1fr 1fr 0.8fr 0.8fr 0.8fr 0.6fr",
+                      gridTemplateColumns: "1fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.6fr",
                       gap: 6,
                       fontSize: 13,
                       color: "#111827"
                     }}>
                       <div style={{ fontWeight: 600 }}>Area</div>
-                      <div style={{ fontWeight: 600 }}>Measurement Group</div>
-                      <div style={{ fontWeight: 600, textAlign: "right" }}>Min</div>
-                      <div style={{ fontWeight: 600, textAlign: "right" }}>Max</div>
-                      <div style={{ fontWeight: 600, textAlign: "right" }}>Avg</div>
+                      <div style={{ fontWeight: 600 }}>Measurement (sqft)</div>
+                      <div style={{ fontWeight: 600 }}>Measurement (2x2)</div>
+                      <div style={{ fontWeight: 600, textAlign: "right" }}>Min Amount</div>
+                      <div style={{ fontWeight: 600, textAlign: "right" }}>Max Amount</div>
+                      <div style={{ fontWeight: 600, textAlign: "right" }}>Avg Amount</div>
                       <div style={{ fontWeight: 600, textAlign: "right" }}>Count</div>
                       {areaAmountStats.map((row, idx) => (
                         <>
                           <div key={`area-${idx}`} style={{ textTransform: "capitalize" }}>{row.area}</div>
-                          <div key={`measurement-${idx}`}>{row.measurement_group || 'N/A'}</div>
+                          <div key={`measurement-sqft-${idx}`}>
+                            {row.measurement_sqft !== null && row.measurement_sqft !== undefined 
+                              ? row.measurement_sqft.toFixed(2)
+                              : 'N/A'
+                            }
+                          </div>
+                          <div key={`measurement-2x2-${idx}`}>
+                            {row.measurement_2x2 || 'N/A'}
+                          </div>
                           <div key={`min-${idx}`} style={{ textAlign: "right" }}>₹{row.min.toFixed(2)}</div>
                           <div key={`max-${idx}`} style={{ textAlign: "right" }}>₹{row.max.toFixed(2)}</div>
                           <div key={`avg-${idx}`} style={{ textAlign: "right" }}>₹{row.avg.toFixed(2)}</div>

@@ -21,7 +21,7 @@ def fetch_data():
     )
     cur = conn.cursor()
     query = """SELECT e.id AS estimator_id, r.name AS room_name, i.name AS item_name, i.id, i.amount,
-           a.city AS area, p.name AS project_name, i.attributes, i.identifier as item_identifier,
+           a.city AS area, p.name AS project_name, i.attributes, i.type_identifier as item_identifier,
            e.user_id, i.image
     FROM vishanti.item i
     JOIN vishanti.room r ON r.id = i.room_id
