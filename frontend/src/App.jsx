@@ -31,6 +31,18 @@ function App() {
   const [useNLP, setUseNLP] = useState(true);
   const [extractedFilters, setExtractedFilters] = useState({});
 
+  // Multilingual support states
+  const [useMultilingual, setUseMultilingual] = useState(false);
+  const [sourceLanguage, setSourceLanguage] = useState("");
+  const [detectedLanguage, setDetectedLanguage] = useState("");
+  const [translatedQuery, setTranslatedQuery] = useState("");
+  const [translationConfidence, setTranslationConfidence] = useState(0);
+  const [showTranslation, setShowTranslation] = useState(false);
+  
+  // Voice recognition language states
+  const [voiceLanguage, setVoiceLanguage] = useState("en-US");
+  const [detectedVoiceLanguage, setDetectedVoiceLanguage] = useState("");
+
   const recognitionRef = useRef(null);
 
   const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
@@ -124,15 +136,31 @@ function App() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
-      recognition.lang = "en-US";
+      
+      // Use automatic language detection
+      recognition.lang = "auto";
       recognition.interimResults = false;
       recognition.maxAlternatives = 1;
+      recognition.continuous = false;
 
       recognition.onresult = (event) => {
         const transcript = event.results[0][0].transcript;
         setQuery(transcript);
+        
+        // Try to detect the language from the transcript
+        if (event.results[0][0].confidence) {
+          // Some browsers provide language detection
+          const detectedLang = detectLanguageFromText(transcript);
+          setDetectedVoiceLanguage(detectedLang);
+        }
       };
+      
       recognition.onend = () => setIsListening(false);
+      
+      recognition.onerror = (event) => {
+        console.error("Speech recognition error:", event.error);
+        setIsListening(false);
+      };
 
       recognitionRef.current = recognition;
     }
@@ -145,15 +173,78 @@ function App() {
     setResults([]);
     setAreaAmountStats([]);
     setAreaStatsAvg(null);
+    setTranslatedQuery("");
+    setDetectedLanguage("");
+    setTranslationConfidence(0);
+    
     try {
-      // Use different endpoints based on NLP toggle
-      const endpoint = useNLP ? '/search/nlp' : '/search/vector';
-      const res = await axios.post(`${BACKEND_URL}${endpoint}`, {
-        query,
-        use_nlp: useNLP
-      });
+      let endpoint, requestData;
+      // Preprocess romanized or non-English text to English first (client-side assist)
+      let finalQuery = query;
+      if (useMultilingual && query && query.trim()) {
+        try {
+          const preprocessRes = await axios.post(`${BACKEND_URL}/speech/text-to-english`, { text: query });
+          const englishQuery = preprocessRes?.data?.english_query;
+          if (englishQuery && typeof englishQuery === 'string' && englishQuery.trim() !== '') {
+            finalQuery = englishQuery;
+            if (englishQuery !== query) {
+              setTranslatedQuery(englishQuery);
+              setDetectedLanguage('auto');
+              setTranslationConfidence(0);
+              setShowTranslation(true);
+            }
+          }
+        } catch (e) {
+          // Non-fatal: fall back to raw query
+        }
+      }
+      
+      if (useMultilingual) {
+        // Use multilingual endpoints
+        if (useNLP) {
+          endpoint = '/search/multilingual/nlp';
+        } else {
+          endpoint = '/search/multilingual/vector';
+        }
+        requestData = {
+          query: finalQuery,
+          source_language: sourceLanguage || null,
+          target_language: "en",
+          use_nlp: useNLP,
+          page: newPage,
+          page_size: pageSize
+        };
+      } else {
+        // Use regular endpoints
+        endpoint = useNLP ? '/search/nlp' : '/search/vector';
+        requestData = {
+          query: finalQuery,
+          use_nlp: useNLP
+        };
+      }
+      
+      const res = await axios.post(`${BACKEND_URL}${endpoint}`, requestData);
 
-      const raw = res?.data?.results;
+      let raw, translationInfo;
+      
+      if (useMultilingual) {
+        // Handle multilingual response
+        raw = res?.data?.search_results;
+        translationInfo = {
+          originalQuery: res?.data?.original_query,
+          translatedQuery: res?.data?.translated_query,
+          detectedLanguage: res?.data?.detected_language,
+          confidence: res?.data?.translation_confidence
+        };
+        
+        setTranslatedQuery(translationInfo.translatedQuery);
+        setDetectedLanguage(translationInfo.detectedLanguage);
+        setTranslationConfidence(translationInfo.confidence);
+        setShowTranslation(translationInfo.translatedQuery !== query);
+      } else {
+        raw = res?.data?.results;
+      }
+      
       const safeArray = Array.isArray(raw) ? raw : [];
 
       const normalized = safeArray.map((item) => {
@@ -230,12 +321,97 @@ function App() {
     }
   };
 
+  // Test translation function
+  const testTranslation = async (text) => {
+    try {
+      const res = await axios.get(`${BACKEND_URL}/translate`, {
+        params: {
+          query: text,
+          source_language: sourceLanguage || null,
+          target_language: "en"
+        }
+      });
+      return res.data;
+    } catch (e) {
+      console.error("Translation test failed:", e);
+      return null;
+    }
+  };
+
+  // Language detection from text - Indian languages only
+  const detectLanguageFromText = (text) => {
+    const lowerText = text.toLowerCase();
+    
+    // Bengali detection (Bengali script)
+    if (/[\u0980-\u09FF]/.test(text)) return 'bn';
+    
+    // Hindi detection (Devanagari script)
+    if (/[\u0900-\u097F]/.test(text)) return 'hi';
+    
+    // Tamil detection (Tamil script)
+    if (/[\u0B80-\u0BFF]/.test(text)) return 'ta';
+    
+    // Telugu detection (Telugu script)
+    if (/[\u0C00-\u0C7F]/.test(text)) return 'te';
+    
+    // Gujarati detection (Gujarati script)
+    if (/[\u0A80-\u0AFF]/.test(text)) return 'gu';
+    
+    // Punjabi detection (Gurmukhi script)
+    if (/[\u0A00-\u0A7F]/.test(text)) return 'pa';
+    
+    // Marathi detection (Devanagari script - same as Hindi but different vocabulary)
+    if (/\b(ghar|ghar|kotha|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche|ami|tumi|apni|se|ora|tara|amra|tomra|apnara|amader|tomader|apnader|tader|amra|tomra|apnara|kothay|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche|ami|tumi|apni|se|ora|tara|amra|tomra|apnara|amader|tomader|apnader|tader|amra|tomra|apnara|kothay|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche)\b/.test(lowerText)) return 'mr';
+    
+    // Bengali detection (transliterated words)
+    if (/\b(bichana|khana|ghar|bari|kotha|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche|ami|tumi|apni|se|ora|tara|amra|tomra|apnara|amader|tomader|apnader|tader|amra|tomra|apnara|kothay|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche|ami|tumi|apni|se|ora|tara|amra|tomra|apnara|amader|tomader|apnader|tader|amra|tomra|apnara|kothay|kothay|kemon|kemon ache|bhalo|kharap|sundor|bhalo lagche)\b/.test(lowerText)) return 'bn';
+    
+    // Default to English
+    return 'en';
+  };
+
+  // Language mapping for voice recognition - Indian languages only
+  const getVoiceLanguageCode = (langCode) => {
+    const languageMap = {
+      'bn': 'bn-BD',      // Bengali
+      'hi': 'hi-IN',      // Hindi
+      'ta': 'ta-IN',      // Tamil
+      'te': 'te-IN',      // Telugu
+      'gu': 'gu-IN',      // Gujarati
+      'pa': 'pa-IN',      // Punjabi
+      'mr': 'mr-IN',      // Marathi
+      'en': 'en-US'       // English
+    };
+    return languageMap[langCode] || 'en-US';
+  };
+
+  // Auto-detect language from voice input and sync with multilingual mode
+  useEffect(() => {
+    if (detectedVoiceLanguage && useMultilingual) {
+      // Auto-set source language based on detected voice language
+      setSourceLanguage(detectedVoiceLanguage);
+    }
+  }, [detectedVoiceLanguage, useMultilingual]);
+
+  // Auto-detect language from text input when in multilingual mode
+  useEffect(() => {
+    if (query && useMultilingual && !sourceLanguage) {
+      const detectedLang = detectLanguageFromText(query);
+      if (detectedLang && detectedLang !== 'en') {
+        setSourceLanguage(detectedLang);
+        setDetectedLanguage(detectedLang);
+      }
+    }
+  }, [query, useMultilingual, sourceLanguage]);
+
   const handleVoiceToggle = () => {
     if (!recognitionRef.current) return;
     if (isListening) {
       recognitionRef.current.stop();
       setIsListening(false);
     } else {
+      // Clear previous detection
+      setDetectedVoiceLanguage("");
       setIsListening(true);
       recognitionRef.current.start();
     }
@@ -332,6 +508,13 @@ function App() {
           >
             {viewMode === "cards" ? "Table View" : "Card View"}
           </button>
+          <button
+            onClick={() => setUseMultilingual(!useMultilingual)}
+            style={{ ...buttonStyle, background: useMultilingual ? "#f59e0b" : "#6b7280" }}
+            title={useMultilingual ? "Multilingual Mode: Search in any language" : "English Mode: Search in English only"}
+          >
+            {useMultilingual ? "🌍 Multilingual" : "🇺🇸 English"}
+          </button>
           <button onClick={handleIngest} style={buttonStyle} disabled={isIngesting}>
             {isIngesting ? "Ingesting..." : "Ingest Data"}
           </button>
@@ -368,10 +551,19 @@ function App() {
           {/* Search Mode Examples */}
           <div style={{ marginBottom: 16, padding: 12, background: useNLP ? "#f0f9ff" : "#f0fdf4", borderRadius: 6, border: `1px solid ${useNLP ? "#0ea5e9" : "#22c55e"}` }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: useNLP ? "#0369a1" : "#15803d", marginBottom: 8 }}>
-              {useNLP ? "💡 NLP Mode Examples:" : "🔍 Vector Mode Examples:"}
+              {useMultilingual ? "🌍 Multilingual Examples:" : (useNLP ? "💡 NLP Mode Examples:" : "🔍 Vector Mode Examples:")}
             </div>
             <div style={{ fontSize: 11, color: useNLP ? "#0369a1" : "#15803d", lineHeight: 1.4 }}>
-              {useNLP ? (
+              {useMultilingual ? (
+                <>
+                  <strong>English:</strong> "wooden door in Mumbai"<br />
+                  <strong>বাংলা:</strong> "কাঠের দরজা মুম্বাইতে"<br />
+                  <strong>हिन्दी:</strong> "लकड़ी का दरवाजा मुंबई में"<br />
+                  <strong>தமிழ்:</strong> "மும்பையில் மர கதவு"<br />
+                  <strong>తెలుగు:</strong> "ముంబైలో చెక్క తలుపు"<br />
+                  <strong>ગુજરાતી:</strong> "મુંબઈમાં લાકડાના દરવાજા"
+                </>
+              ) : useNLP ? (
                 <>
                   • "TV Wall Unit in Bangalore"<br />
                   • "between 50-100 sqft"<br />
@@ -498,6 +690,54 @@ function App() {
           padding: "0 12px"
         }
       }}>
+        Multilingual Controls - Auto-detect only
+        {/* {useMultilingual && (
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 12,
+            margin: "16px auto",
+            padding: "8px 16px",
+            background: "#f0f9ff",
+            borderRadius: 8,
+            border: "1px solid #0ea5e9",
+            maxWidth: 640
+          }}>
+            <span style={{ fontSize: 14, fontWeight: 600, color: "#0369a1" }}>
+              🌍 Auto-detect Indian Languages: বাংলা, हिन्दी, தமிழ், తెలుగు, ગુજરાતી, ਪੰਜਾਬੀ, मराठी
+            </span>
+          </div>
+        )} */}
+
+        {/* Translation Display */}
+        {showTranslation && translatedQuery && (
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+            margin: "8px auto",
+            padding: "8px 16px",
+            background: "#f0fdf4",
+            borderRadius: 8,
+            border: "1px solid #22c55e",
+            maxWidth: 640
+          }}>
+            <span style={{ fontSize: 12, color: "#15803d" }}>
+              🌍 Detected: <strong>{detectedLanguage}</strong>
+            </span>
+            <span style={{ fontSize: 12, color: "#15803d" }}>
+              ➡️ Translated: <strong>"{translatedQuery}"</strong>
+            </span>
+            {translationConfidence > 0 && (
+              <span style={{ fontSize: 12, color: "#15803d" }}>
+                (Confidence: {Math.round(translationConfidence * 100)}%)
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Search bar */}
         <div style={{
           display: "flex",
@@ -516,31 +756,80 @@ function App() {
         }}>
           <input
             type="text"
-            placeholder={useNLP ? "Try: 'TV Wall Unit in Bangalore between 50-100 sqft under ₹50000'" : "Search items with semantic similarity..."}
+            placeholder={
+              useMultilingual 
+                ? (useNLP 
+                    ? "Try: 'কাঠের দরজা মুম্বাইতে' or 'लकड़ी का दरवाजा मुंबई में' or 'மர கதவு மும்பையில்'" 
+                    : "Search in Indian languages: 'bichana', 'ghar', 'வீடு', 'ఇల్లు', 'ઘર'")
+                : (useNLP 
+                  ? "Try: 'TV Wall Unit in Bangalore between 50-100 sqft under ₹50000'" 
+                  : "Search items with semantic similarity...")
+            }
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(1); }}
             style={{ flex: 1, border: "none", outline: "none", background: "transparent" }}
           />
-          {recognitionRef.current && (
-            <button
-              onClick={handleVoiceToggle}
-              title="Voice search"
-              style={{
-                border: "none",
-                background: isListening ? "#dc2626" : "#111827",
-                color: "#fff",
-                borderRadius: 999,
-                padding: "6px 10px",
-                cursor: "pointer"
-              }}
-            >
-              {isListening ? "Stop" : "Mic"}
-            </button>
-          )}
-          <button onClick={() => handleSearch(1)} style={{ ...buttonStyle, marginLeft: 8 }} disabled={isSearching}>
-            {isSearching ? "Searching..." : "Search"}
+          <button
+            onClick={handleVoiceToggle}
+            title="Auto-detect Indian language voice search"
+            style={{
+              border: "none",
+              background: isListening ? "#dc2626" : "#111827",
+              color: "#fff",
+              borderRadius: 999,
+              padding: "6px 10px",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 4
+            }}
+          >
+            {isListening ? "Stop" : "🎤"}
+            <span style={{ fontSize: 10 }}>
+              AUTO
+            </span>
           </button>
+          <button 
+            onClick={() => handleSearch(1)} 
+            style={{ 
+              ...buttonStyle, 
+              marginLeft: 8,
+              background: useMultilingual ? "#f59e0b" : "#111827"
+            }} 
+            disabled={isSearching}
+            title={useMultilingual ? "Search with Indian language support" : "Search in English"}
+          >
+            {isSearching ? "Searching..." : (useMultilingual ? "🌍 Search" : "Search")}
+          </button>
+        </div>
+
+        {/* Auto Language Detection Status */}
+        <div style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          margin: "8px auto",
+          padding: "6px 12px",
+          background: isListening ? "#fef3c7" : (useMultilingual ? "#f0f9ff" : "#f8fafc"),
+          borderRadius: 6,
+          border: `1px solid ${isListening ? "#f59e0b" : (useMultilingual ? "#0ea5e9" : "#e2e8f0")}`,
+          maxWidth: 640
+        }}>
+          {/* <span style={{ fontSize: 12, color: isListening ? "#92400e" : (useMultilingual ? "#0369a1" : "#64748b"), fontWeight: 500 }}>
+            {isListening ? "🎤 Auto-detecting Indian languages..." : (useMultilingual ? "🌍 Multilingual search active" : "🎤 Voice recognition ready for Indian languages")}
+          </span> */}
+          {detectedVoiceLanguage && (
+            <span style={{ fontSize: 10, color: "#10b981", fontWeight: 500 }}>
+              🌍 Detected: {detectedVoiceLanguage.toUpperCase()}
+            </span>
+          )}
+          {isListening && (
+            <span style={{ fontSize: 10, color: "#dc2626", fontWeight: 600, animation: "pulse 1s infinite" }}>
+              ● LISTENING
+            </span>
+          )}
         </div>
 
         {/* Area Stats Avg display near search bar

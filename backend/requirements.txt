@@ -7,3 +7,10 @@ python-multipart
 sqlalchemy
 mysql-connector-python
 python-dotenv
+deep-translator
+langdetect
+indic-transliteration
+# Speech-to-text (offline)
+vosk
+soundfile
+faster-whisper

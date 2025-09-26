@@ -1,5 +1,5 @@
 from .amount_calculator import AmountCalculatorUtils
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import sys
@@ -8,12 +8,16 @@ import re
 import difflib
 from difflib import SequenceMatcher
 from collections import defaultdict
+from deep_translator import GoogleTranslator
+from langdetect import detect
+from indic_transliteration.sanscript import transliterate
 
 from app.qdrant_client_helper import client, COLLECTION_NAME
 from sentence_transformers import SentenceTransformer
 from fastapi.middleware.cors import CORSMiddleware
 from app.ingest import ingest_to_qdrant, fetch_data, parse_item_attributes, measurement_to_sqft
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue, Range
+from app.speech_processor import process_speech_to_english_query, process_text_to_english_query
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -156,7 +160,104 @@ class NLPSearchQuery(BaseModel):
     query: str
     use_nlp: bool = True
 
+
+class InsertItemRequest(BaseModel):
+    estimator_id: int
+    room_name: str
+    item_name: str
+    item_id: int
+    amount: Optional[float] = None
+    area: str
+    project_name: str
+    attributes: Optional[str] = None
+    item_identifier: Optional[str] = None
+    user_id: Optional[int] = None
+    image: Optional[str] = None
+
+    class Config:
+        validate_assignment = True
+
+
+class InsertItemsRequest(BaseModel):
+    items: List[InsertItemRequest]
+
+    class Config:
+        validate_assignment = True
+
+
+class InsertResponse(BaseModel):
+    status: str
+    inserted_count: int
+    errors: List[str] = []
+    success_ids: List[int] = []
+
+
+class MultilingualSearchQuery(BaseModel):
+    query: str
+    source_language: Optional[str] = None  # Auto-detect if not provided
+    target_language: str = "en"  # Default to English
+    use_nlp: bool = True
+    page: Optional[int] = None
+    page_size: Optional[int] = None
+
+    class Config:
+        validate_assignment = True
+
+
+class MultilingualSearchResponse(BaseModel):
+    original_query: str
+    translated_query: str
+    detected_language: str
+    search_results: List[Dict[str, Any]]
+    total_found: int
+    page: Optional[int] = None
+    page_size: Optional[int] = None
+    translation_confidence: Optional[float] = None
+
 # ---------------- Helper ----------------
+
+def translate_query(query: str,
+                    source_lang: Optional[str] = None,
+                    target_lang: str = "en") -> Dict[str, Any]:
+    """
+    Convert text in any language (including romanised Hindi) to English.
+    Adds a transliteration step when needed.
+    """
+    try:
+        # 1. Detect language if not provided
+        detected = source_lang or detect(query)
+
+        # 2. Handle romanised Hindi as an example
+        #    (You can add other languages and rules here)
+        if detected == "hi" and query.isascii():
+            # 'itrans' is a common romanisation scheme
+            query = transliterate(query, "itrans", "devanagari")
+
+        # 3. Translate
+        translator = GoogleTranslator(source=detected, target=target_lang)
+        translated_text = translator.translate(query)
+
+        print(f"Debug: Translated text: {translated_text}")
+        print(f"Debug: Detected language: {detected}")
+        print(f"Debug: Target language: {target_lang}")
+        print(f"Debug: Confidence: 0.9")
+        print(f"Debug: Translation needed: {detected.lower() != target_lang.lower()}")
+
+        return {
+            "translated_query": translated_text,
+            "detected_language": detected,
+            "confidence": 0.9,
+            "translation_needed": detected.lower() != target_lang.lower()
+        }
+
+    except Exception as e:
+        return {
+            "translated_query": query,
+            "detected_language": "unknown",
+            "confidence": 0.0,
+            "translation_needed": False,
+            "error": str(e)
+        }
 
 
 def calculate_amount_from_attributes(item):
@@ -224,6 +325,44 @@ def search_items(data: SearchQuery):
         return {"results": items}
     else:
         return {"results": items, "page": data.page, "page_size": data.page_size}
+
+
+# ---------------- Speech → English → Search ----------------
+
+
+@app.post("/speech/query")
+async def speech_query(audio: UploadFile = File(...)):
+    """
+    Accepts an audio file (PCM WAV recommended), converts to English query string,
+    and returns it. The frontend can then call the standard search endpoints with
+    the returned English text.
+
+    Returns:
+        {"english_query": "..."}
+    """
+    try:
+        content = await audio.read()
+        english_text = process_speech_to_english_query(content)
+        print(f"Debug: English text: {english_text}")
+        return {"english_query": english_text}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Speech processing failed: {e}")
+
+
+@app.post("/speech/text-to-english")
+async def text_to_english(payload: Dict[str, str]):
+    """
+    For already recognized text on client: detect → (optional transliterate) → translate.
+    """
+    txt = payload.get("text", "") if payload else ""
+    if not txt:
+        return {"english_query": ""}
+    try:
+        english_text = process_text_to_english_query(txt)
+        print(f"Debug: English text: {english_text}")
+        return {"english_query": english_text}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Text processing failed: {e}")
 
 
 @app.post("/search/nlp")
@@ -1053,6 +1192,188 @@ def search_by_itemname(data: FilteredSearchQuery):
     return {"results": items}
 
 
+# ---------------- Multilingual Search Endpoints ----------------
+
+
+@app.post("/search/multilingual", response_model=MultilingualSearchResponse)
+def search_multilingual(data: MultilingualSearchQuery):
+    """
+    Search with multilingual support. Translates query to English and performs vector search.
+    Supports auto-detection of source language or manual specification.
+    """
+    try:
+        # Translate the query to English
+        translation_result = translate_query(
+            query=data.query,
+            source_lang=data.source_language,
+            target_lang=data.target_language
+        )
+        
+        translated_query = translation_result["translated_query"]
+        detected_language = translation_result["detected_language"]
+        confidence = translation_result.get("confidence", 0.0)
+        
+        # Perform vector search with translated query
+        vector = MODEL.encode(translated_query).tolist()
+        
+        if data.page is None or data.page_size is None:
+            result = client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=vector,
+                limit=10000
+            )
+        else:
+            page = max(1, data.page)
+            page_size = max(1, min(50, data.page_size))
+            offset = (page - 1) * page_size
+            result = client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=vector,
+                limit=page_size,
+                offset=offset
+            )
+        
+        items = []
+        for r in result:
+            try:
+                item = r.payload.copy()
+                current_amount = item.get('amount')
+                if not current_amount or current_amount == 0:
+                    calculated_amount = calculate_amount_from_attributes(item)
+                    if calculated_amount > 0:
+                        item['amount'] = calculated_amount
+                items.append(item)
+            except Exception as e:
+                print(f"Error processing item: {e}")
+                continue
+        
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=translated_query,
+            detected_language=detected_language,
+            search_results=items,
+            total_found=len(items),
+            page=data.page,
+            page_size=data.page_size,
+            translation_confidence=confidence
+        )
+        
+    except Exception as e:
+        print(f"Error in multilingual search: {e}")
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=data.query,
+            detected_language="unknown",
+            search_results=[],
+            total_found=0,
+            page=data.page,
+            page_size=data.page_size,
+            translation_confidence=0.0
+        )
+
+
+@app.post("/search/multilingual/nlp", response_model=MultilingualSearchResponse)
+def search_multilingual_nlp(data: MultilingualSearchQuery):
+    """
+    Multilingual search with NLP processing. Translates query and applies NLP filters.
+    """
+    try:
+        # Translate the query to English
+        translation_result = translate_query(
+            query=data.query,
+            source_lang=data.source_language,
+            target_lang=data.target_language
+        )
+        
+        translated_query = translation_result["translated_query"]
+        detected_language = translation_result["detected_language"]
+        confidence = translation_result.get("confidence", 0.0)
+        
+        # Use the existing NLP search logic with translated query
+        nlp_data = NLPSearchQuery(query=translated_query, use_nlp=data.use_nlp)
+        nlp_result = search_with_nlp(nlp_data)
+        
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=translated_query,
+            detected_language=detected_language,
+            search_results=nlp_result.get("results", []),
+            total_found=nlp_result.get("total_found", 0),
+            translation_confidence=confidence
+        )
+        
+    except Exception as e:
+        print(f"Error in multilingual NLP search: {e}")
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=data.query,
+            detected_language="unknown",
+            search_results=[],
+            total_found=0,
+            translation_confidence=0.0
+        )
+
+
+@app.post("/search/multilingual/vector", response_model=MultilingualSearchResponse)
+def search_multilingual_vector(data: MultilingualSearchQuery):
+    """
+    Multilingual search with vector similarity. Translates query and performs keyword-first vector search.
+    """
+    try:
+        # Translate the query to English
+        translation_result = translate_query(
+            query=data.query,
+            source_lang=data.source_language,
+            target_lang=data.target_language
+        )
+        
+        translated_query = translation_result["translated_query"]
+        detected_language = translation_result["detected_language"]
+        confidence = translation_result.get("confidence", 0.0)
+        
+        # Use the existing vector search logic with translated query
+        vector_data = NLPSearchQuery(query=translated_query, use_nlp=data.use_nlp)
+        vector_result = search_with_vector_similarity(vector_data)
+        
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=translated_query,
+            detected_language=detected_language,
+            search_results=vector_result.get("results", []),
+            total_found=vector_result.get("total_found", 0),
+            translation_confidence=confidence
+        )
+        
+    except Exception as e:
+        print(f"Error in multilingual vector search: {e}")
+        return MultilingualSearchResponse(
+            original_query=data.query,
+            translated_query=data.query,
+            detected_language="unknown",
+            search_results=[],
+            total_found=0,
+            translation_confidence=0.0
+        )
+
+
+@app.get("/translate")
+def translate_text(query: str, source_language: Optional[str] = None, target_language: str = "en"):
+    """
+    Simple translation endpoint for testing translation functionality.
+    """
+    try:
+        result = translate_query(query, source_language, target_language)
+        return {
+            "original_text": query,
+            "translated_text": result["translated_query"],
+            "detected_language": result["detected_language"],
+            "confidence": result.get("confidence", 0.0),
+            "translation_needed": result.get("translation_needed", False)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/ingest")
 def trigger_ingest():
     ingest_to_qdrant()
@@ -1134,3 +1455,390 @@ def get_db_items():
         for k, v in stats.items()
     ]
     return {"items": items, "stats": stats_out}
+
+
+# ---------------- Insert API Endpoints ----------------
+
+
+@app.post("/insert/item", response_model=InsertResponse)
+def insert_single_item(data: InsertItemRequest):
+    """
+    Insert a single item into the Qdrant database.
+    Similar to the ingest process but for individual items.
+    """
+    try:
+        # Create text for vector encoding
+        text = f"{data.item_name} in {data.room_name} of {data.project_name}, located at {data.area}"
+        vector = MODEL.encode(text).tolist()
+        
+        # Parse attributes if provided
+        parsed_attrs = {}
+        if data.attributes:
+            parsed_attrs = parse_item_attributes(data.attributes)
+        
+        # Calculate measurement
+        measurement = parsed_attrs.get("Measurement")
+        measurement_sqft = measurement_to_sqft(measurement)
+        
+        # Calculate amount if missing/null using AmountCalculatorUtils
+        amount_to_store = data.amount
+        try:
+            if not amount_to_store or amount_to_store == 0:
+                type_identifier = None
+                if isinstance(data.item_identifier, str):
+                    if "WD" in data.item_identifier:
+                        type_identifier = "WD"
+                    elif "FC" in data.item_identifier:
+                        type_identifier = "FC"
+                    elif "ACS" in data.item_identifier:
+                        type_identifier = "ACS"
+                    elif "LF" in data.item_identifier:
+                        type_identifier = "LF"
+                    elif "OTH" in data.item_identifier:
+                        type_identifier = "OTH"
+                if type_identifier:
+                    dummy_item = type("Item", (), {"attributes": data.attributes})()
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    if calculated_amount and calculated_amount > 0:
+                        amount_to_store = calculated_amount
+        except Exception:
+            # Swallow calculation errors and fall back to original amount
+            pass
+        
+        # Prepare image data
+        image_data = data.image
+        if isinstance(image_data, dict) and "default" in image_data:
+            image_data = image_data["default"]
+        
+        # Insert into Qdrant
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                {
+                    "id": data.item_id,
+                    "vector": vector,
+                    "payload": {
+                        "estimator_id": data.estimator_id,
+                        "room_name": data.room_name,
+                        "item_name": data.item_name,
+                        "amount": amount_to_store,
+                        "area": data.area,
+                        "project_name": data.project_name,
+                        "attributes": data.attributes,
+                        "attributes_parsed": parsed_attrs,
+                        "measurement_sqft": measurement_sqft,
+                        "id": data.item_id,
+                        "item_identifier": data.item_identifier,
+                        "user_id": data.user_id,
+                        "image": image_data
+                    }
+                }
+            ]
+        )
+        
+        return InsertResponse(
+            status="success",
+            inserted_count=1,
+            success_ids=[data.item_id]
+        )
+        
+    except Exception as e:
+        return InsertResponse(
+            status="error",
+            inserted_count=0,
+            errors=[str(e)]
+        )
+
+
+@app.post("/insert/items", response_model=InsertResponse)
+def insert_multiple_items(data: InsertItemsRequest):
+    """
+    Insert multiple items into the Qdrant database.
+    Processes items in batch for better performance.
+    """
+    success_ids = []
+    errors = []
+    
+    for item_data in data.items:
+        try:
+            # Create text for vector encoding
+            text = f"{item_data.item_name} in {item_data.room_name} of {item_data.project_name}, located at {item_data.area}"
+            vector = MODEL.encode(text).tolist()
+            
+            # Parse attributes if provided
+            parsed_attrs = {}
+            if item_data.attributes:
+                parsed_attrs = parse_item_attributes(item_data.attributes)
+            
+            # Calculate measurement
+            measurement = parsed_attrs.get("Measurement")
+            measurement_sqft = measurement_to_sqft(measurement)
+            
+            # Calculate amount if missing/null using AmountCalculatorUtils
+            amount_to_store = item_data.amount
+            try:
+                if not amount_to_store or amount_to_store == 0:
+                    type_identifier = None
+                    if isinstance(item_data.item_identifier, str):
+                        if "WD" in item_data.item_identifier:
+                            type_identifier = "WD"
+                        elif "FC" in item_data.item_identifier:
+                            type_identifier = "FC"
+                        elif "ACS" in item_data.item_identifier:
+                            type_identifier = "ACS"
+                        elif "LF" in item_data.item_identifier:
+                            type_identifier = "LF"
+                        elif "OTH" in item_data.item_identifier:
+                            type_identifier = "OTH"
+                    if type_identifier:
+                        dummy_item = type("Item", (), {"attributes": item_data.attributes})()
+                        calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                        if calculated_amount and calculated_amount > 0:
+                            amount_to_store = calculated_amount
+            except Exception:
+                # Swallow calculation errors and fall back to original amount
+                pass
+            
+            # Prepare image data
+            image_data = item_data.image
+            if isinstance(image_data, dict) and "default" in image_data:
+                image_data = image_data["default"]
+            
+            # Insert into Qdrant
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=[
+                    {
+                        "id": item_data.item_id,
+                        "vector": vector,
+                        "payload": {
+                            "estimator_id": item_data.estimator_id,
+                            "room_name": item_data.room_name,
+                            "item_name": item_data.item_name,
+                            "amount": amount_to_store,
+                            "area": item_data.area,
+                            "project_name": item_data.project_name,
+                            "attributes": item_data.attributes,
+                            "attributes_parsed": parsed_attrs,
+                            "measurement_sqft": measurement_sqft,
+                            "id": item_data.item_id,
+                            "item_identifier": item_data.item_identifier,
+                            "user_id": item_data.user_id,
+                            "image": image_data
+                        }
+                    }
+                ]
+            )
+            
+            success_ids.append(item_data.item_id)
+            
+        except Exception as e:
+            errors.append(f"Item {item_data.item_id}: {str(e)}")
+    
+    return InsertResponse(
+        status="success" if not errors else "partial_success",
+        inserted_count=len(success_ids),
+        errors=errors,
+        success_ids=success_ids
+    )
+
+
+@app.post("/insert/batch", response_model=InsertResponse)
+def insert_batch_items(data: InsertItemsRequest):
+    """
+    Insert multiple items into the Qdrant database using batch upsert for better performance.
+    """
+    try:
+        points = []
+        success_ids = []
+        errors = []
+        
+        for item_data in data.items:
+            try:
+                # Create text for vector encoding
+                text = f"{item_data.item_name} in {item_data.room_name} of {item_data.project_name}, located at {item_data.area}"
+                vector = MODEL.encode(text).tolist()
+                
+                # Parse attributes if provided
+                parsed_attrs = {}
+                if item_data.attributes:
+                    parsed_attrs = parse_item_attributes(item_data.attributes)
+                
+                # Calculate measurement
+                measurement = parsed_attrs.get("Measurement")
+                measurement_sqft = measurement_to_sqft(measurement)
+                
+                # Calculate amount if not provided
+                amount_to_store = item_data.amount
+                if not amount_to_store or amount_to_store == 0:
+                    try:
+                        type_identifier = None
+                        if item_data.item_identifier:
+                            if "WD" in item_data.item_identifier:
+                                type_identifier = "WD"
+                            elif "FC" in item_data.item_identifier:
+                                type_identifier = "FC"
+                            elif "ACS" in item_data.item_identifier:
+                                type_identifier = "ACS"
+                            elif "LF" in item_data.item_identifier:
+                                type_identifier = "LF"
+                            elif "OTH" in item_data.item_identifier:
+                                type_identifier = "OTH"
+                        
+                        if type_identifier and item_data.attributes:
+                            dummy_item = type("Item", (), {"attributes": item_data.attributes})()
+                            calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                            if calculated_amount and calculated_amount > 0:
+                                amount_to_store = calculated_amount
+                    except Exception:
+                        # Swallow calculation errors and fall back to original amount
+                        pass
+                
+                # Prepare image data
+                image_data = item_data.image
+                if isinstance(image_data, dict) and "default" in image_data:
+                    image_data = image_data["default"]
+                
+                # Prepare point for batch insert
+                points.append({
+                    "id": item_data.item_id,
+                    "vector": vector,
+                    "payload": {
+                        "estimator_id": item_data.estimator_id,
+                        "room_name": item_data.room_name,
+                        "item_name": item_data.item_name,
+                        "amount": amount_to_store,
+                        "area": item_data.area,
+                        "project_name": item_data.project_name,
+                        "attributes": item_data.attributes,
+                        "attributes_parsed": parsed_attrs,
+                        "measurement_sqft": measurement_sqft,
+                        "id": item_data.item_id,
+                        "item_identifier": item_data.item_identifier,
+                        "user_id": item_data.user_id,
+                        "image": image_data
+                    }
+                })
+                
+                success_ids.append(item_data.item_id)
+                
+            except Exception as e:
+                errors.append(f"Item {item_data.item_id}: {str(e)}")
+        
+        # Batch insert all points at once
+        if points:
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points
+            )
+        
+        return InsertResponse(
+            status="success" if not errors else "partial_success",
+            inserted_count=len(success_ids),
+            errors=errors,
+            success_ids=success_ids
+        )
+        
+    except Exception as e:
+        return InsertResponse(
+            status="error",
+            inserted_count=0,
+            errors=[str(e)]
+        )
+
+
+@app.delete("/delete/item/{item_id}")
+def delete_item(item_id: int):
+    """
+    Delete an item from the Qdrant database by item ID.
+    """
+    try:
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=[item_id]
+        )
+        return {"status": "success", "message": f"Item {item_id} deleted successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.put("/update/item/{item_id}")
+def update_item(item_id: int, data: InsertItemRequest):
+    """
+    Update an existing item in the Qdrant database.
+    This will upsert the item with the new data.
+    """
+    try:
+        # Create text for vector encoding
+        text = f"{data.item_name} in {data.room_name} of {data.project_name}, located at {data.area}"
+        vector = MODEL.encode(text).tolist()
+        
+        # Parse attributes if provided
+        parsed_attrs = {}
+        if data.attributes:
+            parsed_attrs = parse_item_attributes(data.attributes)
+        
+        # Calculate measurement
+        measurement = parsed_attrs.get("Measurement")
+        measurement_sqft = measurement_to_sqft(measurement)
+        
+        # Calculate amount if missing/null using AmountCalculatorUtils
+        amount_to_store = data.amount
+        try:
+            if not amount_to_store or amount_to_store == 0:
+                type_identifier = None
+                if isinstance(data.item_identifier, str):
+                    if "WD" in data.item_identifier:
+                        type_identifier = "WD"
+                    elif "FC" in data.item_identifier:
+                        type_identifier = "FC"
+                    elif "ACS" in data.item_identifier:
+                        type_identifier = "ACS"
+                    elif "LF" in data.item_identifier:
+                        type_identifier = "LF"
+                    elif "OTH" in data.item_identifier:
+                        type_identifier = "OTH"
+                if type_identifier:
+                    dummy_item = type("Item", (), {"attributes": data.attributes})()
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    if calculated_amount and calculated_amount > 0:
+                        amount_to_store = calculated_amount
+        except Exception:
+            # Swallow calculation errors and fall back to original amount
+            pass
+        
+        # Prepare image data
+        image_data = data.image
+        if isinstance(image_data, dict) and "default" in image_data:
+            image_data = image_data["default"]
+        
+        # Update in Qdrant (upsert will update if exists, insert if not)
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                {
+                    "id": item_id,
+                    "vector": vector,
+                    "payload": {
+                        "estimator_id": data.estimator_id,
+                        "room_name": data.room_name,
+                        "item_name": data.item_name,
+                        "amount": amount_to_store,
+                        "area": data.area,
+                        "project_name": data.project_name,
+                        "attributes": data.attributes,
+                        "attributes_parsed": parsed_attrs,
+                        "measurement_sqft": measurement_sqft,
+                        "id": item_id,
+                        "item_identifier": data.item_identifier,
+                        "user_id": data.user_id,
+                        "image": image_data
+                    }
+                }
+            ]
+        )
+        
+        return {"status": "success", "message": f"Item {item_id} updated successfully"}
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
