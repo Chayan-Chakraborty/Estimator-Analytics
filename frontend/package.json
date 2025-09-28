@@ -11,6 +11,7 @@
     "lucide-react": "^0.544.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-speech-recognition": "^4.0.1",
     "react-speech-to-text": "^1.1.1"
   },
   "devDependencies": {

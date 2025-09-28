@@ -14,3 +14,10 @@ indic-transliteration
 vosk
 soundfile
 faster-whisper
+openai-whisper
+scikit-learn
+wordfreq
+transformers
+sentencepiece
+torch
+keybert

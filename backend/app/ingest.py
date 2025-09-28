@@ -1,4 +1,5 @@
 from sentence_transformers import SentenceTransformer
+from keybert import KeyBERT
 from app.qdrant_client_helper import client, create_collection, COLLECTION_NAME
 from app.amount_calculator import AmountCalculatorUtils
 import mysql.connector
@@ -8,6 +9,7 @@ import json
 import re
 
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+KW_MODEL = KeyBERT(model=MODEL)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
@@ -122,8 +124,6 @@ def ingest_to_qdrant():
     data = fetch_data()
     for row in data:
         estimator_id, room_name, item_name, item_id, amount, area, project_name, attributes, item_identifier, user_id, image = row
-        text = f"{item_name} in {room_name} of {project_name}, located at {area}"
-        vector = MODEL.encode(text).tolist()
         # Qdrant expects point id as unsigned int or UUID
         try:
             point_id = int(item_id)
@@ -134,6 +134,43 @@ def ingest_to_qdrant():
         parsed_attrs = parse_item_attributes(attributes)
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
+
+        text = (
+            f"The material is {parsed_attrs.get('Material')} with a {parsed_attrs.get('Finish')} finish, "
+            f"priced at {parsed_attrs.get('Rate')}, and measuring {parsed_attrs.get('Measurement')}. "
+            f"{item_name} in {room_name} of {project_name}, located at {area}."
+        )
+        vector = MODEL.encode(text).tolist()
+
+        # Derive stable keywords for filtering at query time
+        try:
+            raw_keywords = KW_MODEL.extract_keywords(
+                text,
+                keyphrase_ngram_range=(1, 2),
+                stop_words='english',
+                top_n=12
+            )
+            # Blacklist attribute labels (exact matches)
+            attr_blacklist = {
+                "rate", "rate per sqft", "quantity", "price/unit", "price",
+                "measurement", "material", "finish", "description", "brand"
+            }
+            def allowed_phrase(phrase: str) -> bool:
+                kl = phrase.strip().lower()
+                if not kl:
+                    return False
+                # reject if exact or any token equals a blacklisted label
+                if kl in attr_blacklist:
+                    return False
+                toks = re.findall(r"\b\w+\b", kl)
+                return all(tok not in attr_blacklist for tok in toks)
+
+            keywords = sorted({
+                kw.strip().lower() for kw, _ in raw_keywords
+                if isinstance(kw, str) and allowed_phrase(kw)
+            })
+        except Exception:
+            keywords = []
 
         # Calculate amount if missing/null using AmountCalculatorUtils
         amount_to_store = amount
@@ -177,7 +214,8 @@ def ingest_to_qdrant():
                         "measurement_sqft": measurement_sqft,
                         "id": item_id,
                         "item_identifier": item_identifier,
-                        "image": image
+                        "image": image,
+                        "keywords": keywords
                     }
                 }
             ]

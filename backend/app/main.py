@@ -6,7 +6,9 @@ import sys
 import os
 import re
 import difflib
+import numpy as np
 from difflib import SequenceMatcher
+from app.mappings import MATERIAL_ALIASES
 from collections import defaultdict
 from deep_translator import GoogleTranslator
 from langdetect import detect
@@ -16,11 +18,15 @@ from app.qdrant_client_helper import client, COLLECTION_NAME
 from sentence_transformers import SentenceTransformer
 from fastapi.middleware.cors import CORSMiddleware
 from app.ingest import ingest_to_qdrant, fetch_data, parse_item_attributes, measurement_to_sqft
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue, Range
+from qdrant_client.http.models import Filter, FieldCondition, MatchAny, MatchValue, Range
 from app.speech_processor import process_speech_to_english_query, process_text_to_english_query
+from app.ai_layer import intelligent_translate
+from transformers import pipeline
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP
+from qdrant_client import QdrantClient
 
+zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
 app = FastAPI()
@@ -352,15 +358,17 @@ async def speech_query(audio: UploadFile = File(...)):
 @app.post("/speech/text-to-english")
 async def text_to_english(payload: Dict[str, str]):
     """
-    For already recognized text on client: detect → (optional transliterate) → translate.
+    Intelligent text translation: detect language, handle romanized Indic by
+    trying multiple scripts, translate to fluent English, and keep meaning/tone.
     """
     txt = payload.get("text", "") if payload else ""
+    src = payload.get("source_language") if payload else None
     if not txt:
         return {"english_query": ""}
     try:
-        english_text = process_text_to_english_query(txt)
+        english_text, detected_src = intelligent_translate(txt, src)
         print(f"Debug: English text: {english_text}")
-        return {"english_query": english_text}
+        return {"english_query": english_text, "detected_language": detected_src}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Text processing failed: {e}")
 
@@ -464,138 +472,449 @@ def search_with_nlp(data: NLPSearchQuery):
         return {"results": [], "extracted_filters": {}, "error": str(e)}
 
 
-@app.post("/search/vector")
-def search_with_vector_similarity(data: NLPSearchQuery):
+# @app.post("/search/vector")
+# def search_with_vector_similarity(data: NLPSearchQuery):
+#     """
+#     Keyword-first search with vector similarity ranking.
+#     First extracts keywords from query, then searches for items containing those keywords,
+#     then ranks by vector similarity.
+#     """
+#     try:
+#         # Extract keywords from query first
+#         query_lower = data.query.lower()
+#         extracted_keywords = []
+        
+#         # Smart keyword extraction - filter out stop words
+#         import re
+#         from difflib import SequenceMatcher
+#         from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP
+        
+#         # Common stop words to ignore
+#         # Start with sklearn's general English stopwords, then add domain-generic words that
+#         # we don't want to influence matching regardless of language
+#         stop_words = set(SK_STOP)
+#         stop_words.update({'material', 'finish', 'color', 'size', 'type', 'style', 'design', 'model', 'brand',
+#                            'room', 'area', 'location', 'city', 'price', 'cost', 'amount', 'value', 'rate'})
+
+#         # Remove short romanized filler words heuristically: words of length <= 3 that are very common
+#         words = re.findall(r'\b\w+\b', query_lower)
+#         common_short_fillers = {w for w in words if len(w) <= 3}
+#         stop_words.update(common_short_fillers)
+        
+#         # Split by common words and punctuation
+#         # Filter out stop words and short words
+#         extracted_keywords = [
+#             word for word in words 
+#             if len(word) > 2 and word not in stop_words
+#         ]
+
+#         # Corrections map for common misspellings
+#         corrections = {
+#             'blockboaard': 'blockboard',
+#             'blockbord': 'blockboard',
+#             'consol': 'console'
+#         }
+#         extracted_keywords = [corrections.get(w, w) for w in extracted_keywords]
+        
+#         # Debug: print extracted keywords
+#         print(f"Debug: Query: {data.query}")
+#         print(f"Debug: All words: {words}")
+#         print(f"Debug: Extracted keywords: {extracted_keywords}")
+        
+#         # Get all items from the collection for keyword filtering
+#         all_items = []
+#         scroll_result = client.scroll(
+#             collection_name=COLLECTION_NAME,
+#             limit=10000,
+#             with_payload=True
+#         )
+        
+#         for point in scroll_result[0]:
+#             try:
+#                 item = point.payload.copy()
+#                 # Calculate amount if missing
+#                 current_amount = item.get('amount')
+#                 if not current_amount or current_amount == 0:
+#                     calculated_amount = calculate_amount_from_attributes(item)
+#                     if calculated_amount > 0:
+#                         item['amount'] = calculated_amount
+#                 # Build a consolidated searchable text field once
+#                 item_text = ""
+#                 item_text += f" {item.get('item_name', '')}"
+#                 item_text += f" {item.get('room_name', '')}"
+#                 item_text += f" {item.get('area', '')}"
+#                 item_text += f" {item.get('project_name', '')}"
+#                 attrs_parsed = item.get('attributes_parsed', {})
+#                 if isinstance(attrs_parsed, dict):
+#                     for _k, _v in attrs_parsed.items():
+#                         item_text += f" {_v}"
+#                 item['__search_text__'] = item_text.lower()
+#                 all_items.append(item)
+#             except Exception as e:
+#                 print(f"Error processing item: {e}")
+#                 continue
+        
+#         # Helper: normalize ascii-only string
+#         def norm(s: str) -> str:
+#             s = (s or '').lower()
+#             return re.sub(r'[^a-z0-9 ]+', ' ', s)
+
+#         # Fuzzy contains: substring or SequenceMatcher ratio >= 0.82 against any token
+#         def fuzzy_contains(haystack: str, needle: str) -> bool:
+#             h = norm(haystack)
+#             n = norm(needle)
+#             if not n:
+#                 return False
+#             if n in h:
+#                 return True
+#             tokens = h.split()
+#             for t in tokens:
+#                 if len(t) < 3:
+#                     continue
+#                 if SequenceMatcher(None, t, n).ratio() >= 0.82:
+#                     return True
+#             return False
+
+#         # Narrow keywords to those that appear in at least one item (avoid forcing filler words)
+#         def appears_in_corpus(kw: str) -> bool:
+#             for it in all_items:
+#                 if fuzzy_contains(it.get('__search_text__', ''), kw):
+#                     return True
+#             return False
+
+#         effective_keywords = [kw for kw in extracted_keywords if appears_in_corpus(kw)]
+#         # If nothing left, fall back to original keywords (so we don't empty the query)
+#         if not effective_keywords:
+#             effective_keywords = extracted_keywords
+
+#         # Material-awareness: if the query mentions a specific material (e.g., blockboard),
+#         # only keep items whose parsed Material matches that material and exclude others
+#         material_aliases = MATERIAL_ALIASES
+#         # detect requested material from keywords
+#         requested_material = None
+#         for kw in effective_keywords:
+#             for mat_key, aliases in material_aliases.items():
+#                 if kw in aliases or kw == mat_key:
+#                     requested_material = mat_key
+#                     break
+#             if requested_material:
+#                 break
+
+#         # Filter items that contain ALL of the effective keywords (with fuzzy matching)
+#         filtered_items = []
+#         for item in all_items:
+#             # Check if item contains any of the keywords
+#             item_text = ""
+            
+#             # Combine all searchable text from the item
+#             item_text += f" {item.get('item_name', '')}"
+#             item_text += f" {item.get('room_name', '')}"
+#             item_text += f" {item.get('area', '')}"
+#             item_text += f" {item.get('project_name', '')}"
+            
+#             # Add attributes
+#             attrs_parsed = item.get('attributes_parsed', {})
+#             if isinstance(attrs_parsed, dict):
+#                 for key, value in attrs_parsed.items():
+#                     item_text += f" {value}"
+            
+#             item_text = item_text.lower()
+            
+#             # If material is requested, enforce exact material family match
+#             if requested_material:
+#                 mat_val = ''
+#                 attrs_parsed = item.get('attributes_parsed', {})
+#                 if isinstance(attrs_parsed, dict):
+#                     mat_val = str(attrs_parsed.get('Material') or '')
+#                 mat_norm = norm(mat_val)
+#                 allowed_aliases = material_aliases.get(requested_material, {requested_material})
+#                 # ensure one of the aliases is present and competing materials are not
+#                 if not any(norm(a) in mat_norm for a in allowed_aliases):
+#                     continue
+
+#             # Check if ALL keywords match
+#             keyword_matches = 0
+#             for keyword in effective_keywords:
+#                 if fuzzy_contains(item_text, keyword):
+#                     keyword_matches += 1
+            
+#             # Only include items that have ALL keywords matching
+#             if keyword_matches == len(effective_keywords) and len(effective_keywords) > 0:
+#                 item['keyword_matches'] = keyword_matches
+#                 filtered_items.append(item)
+        
+#         # Now rank by vector similarity
+#         if filtered_items:
+#             vector = MODEL.encode(data.query).tolist()
+            
+#             # Calculate similarity scores for filtered items
+#             scored_items = []
+#             for item in filtered_items:
+#                 try:
+#                     # Create a text representation for vector encoding
+#                     item_text = f"{item.get('item_name', '')} {item.get('room_name', '')} {item.get('area', '')}"
+#                     attrs_parsed = item.get('attributes_parsed', {})
+#                     if isinstance(attrs_parsed, dict):
+#                         for key, value in attrs_parsed.items():
+#                             item_text += f" {value}"
+                    
+#                     # Encode the item text
+#                     item_vector = MODEL.encode(item_text).tolist()
+                    
+#                     # Calculate cosine similarity
+#                     import numpy as np
+#                     similarity = np.dot(vector, item_vector) / (np.linalg.norm(vector) * np.linalg.norm(item_vector))
+                    
+#                     item['similarity_score'] = round(float(similarity), 4)
+#                     scored_items.append(item)
+#                 except Exception as e:
+#                     print(f"Error calculating similarity: {e}")
+#                     continue
+            
+#             # Sort by similarity score (highest first)
+#             scored_items.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+#             items = scored_items
+#         else:
+#             items = []
+        
+#         return {
+#             "results": items,
+#             "query": data.query,
+#             "total_found": len(items),
+#             "search_type": "keyword_first_vector_similarity",
+#             "extracted_keywords": effective_keywords
+#         }
+#     except Exception as e:
+#         print(f"Error in vector search: {e}")
+#         return {"results": [], "error": str(e), "total_found": 0}
+
+from keybert import KeyBERT
+
+class NLPSearchQuery(BaseModel):
+    query: str
+    top_k: int = 10
+
+
+# Embedding and keyword extraction models (must match Qdrant collection dim=384)
+MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+KW_MODEL = KeyBERT(model=MODEL)
+
+
+def build_retrieval_prompt(user_query: str, top_k: int = 10) -> str:
     """
-    Keyword-first search with vector similarity ranking.
-    First extracts keywords from query, then searches for items containing those keywords,
-    then ranks by vector similarity.
+    Returns a ready-to-send prompt for an external AI planner to steer semantic search.
     """
+    template = (
+        "You are a semantic retrieval planner for an interior/furniture catalog stored in a vector database (Qdrant).\n\n"
+        "Task:\n"
+        "- Understand the user’s intent from the query.\n"
+        "- Propose high-signal keywords and keyphrases (1–2 grams) for payload filters.\n"
+        "- Produce an English embedding text that best captures the intent for vector search.\n"
+        "- Return a clear, minimal plan the backend can follow.\n\n"
+        "Context:\n"
+        "- Data fields: item_name, room_name, project_name, area, attributes_parsed (Material, Finish, Measurement, Rate), keywords (precomputed).\n"
+        "- Vector model: all-MiniLM-L6-v2 (384-dim).\n"
+        "- Backend execution: filter keywords ANY; embed embedding_text; vector search limit=TOP_K; post-enrich.\n\n"
+        "Rules:\n"
+        "- Prefer specific, discriminative keywords over generic ones.\n"
+        "- Include only domain-relevant terms (e.g., console table, blockboard).\n"
+        "- Exclude connectors/fillers (and, with, of, by, for, made, using, diye/toiri, etc.).\n"
+        "- Never invent attributes not implied by the query.\n\n"
+        "Input:\n"
+        f"- user_query: \"{user_query}\"\n"
+        f"- top_k: {top_k}\n\n"
+        "Output (JSON only):\n"
+        "{\n"
+        "  \"embedding_text\": \"STRING — final English text to embed for vector search\",\n"
+        "  \"keywords\": [\"TERM1\", \"TERM2\"],\n"
+        "  \"notes\": \"Optional short note on interpretation\"\n"
+        "}"
+    )
+    return template
+
+
+class VectorPlan(BaseModel):
+    embedding_text: str
+    keywords: List[str] = []
+    top_k: Optional[int] = 10
+
+
+def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
     try:
-        # Extract keywords from query first
-        query_lower = data.query.lower()
-        extracted_keywords = []
-        
-        # Smart keyword extraction - filter out stop words
-        import re
-        
-        # Common stop words to ignore
-        stop_words = {
-            'with', 'and', 'or', 'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'by', 'from',
-            'material', 'finish', 'color', 'size', 'type', 'style', 'design', 'model', 'brand',
-            'room', 'area', 'location', 'city', 'price', 'cost', 'amount', 'value', 'rate'
-        }
-        
-        # Split by common words and punctuation
-        words = re.findall(r'\b\w+\b', query_lower)
-        
-        # Filter out stop words and short words
-        extracted_keywords = [
-            word for word in words 
-            if len(word) > 2 and word not in stop_words
-        ]
-        
-        # Debug: print extracted keywords
-        print(f"Debug: Query: {data.query}")
-        print(f"Debug: All words: {words}")
-        print(f"Debug: Extracted keywords: {extracted_keywords}")
-        
-        # Get all items from the collection for keyword filtering
-        all_items = []
-        scroll_result = client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=10000,
-            with_payload=True
-        )
-        
-        for point in scroll_result[0]:
+        embed_text = (plan.embedding_text or "").strip()
+        if not embed_text:
+            return {"results": [], "total_found": 0, "error": "empty embedding_text"}
+
+        query_vector = MODEL.encode(embed_text).tolist()
+
+        q_filter = None
+        if plan.keywords:
             try:
-                item = point.payload.copy()
-                # Calculate amount if missing
-                current_amount = item.get('amount')
-                if not current_amount or current_amount == 0:
-                    calculated_amount = calculate_amount_from_attributes(item)
-                    if calculated_amount > 0:
-                        item['amount'] = calculated_amount
-                all_items.append(item)
-            except Exception as e:
-                print(f"Error processing item: {e}")
+                q_filter = Filter(must=[FieldCondition(key="keywords", match=MatchAny(any=plan.keywords))])
+            except Exception:
+                q_filter = None
+
+        raw = client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=max(1, min(50, getattr(plan, 'top_k', 10) or 10)),
+            query_filter=q_filter
+        )
+
+        items: List[Dict[str, Any]] = []
+        strict_keywords = [k.strip().lower() for k in (plan.keywords or []) if k and k.strip()]
+        for r in raw:
+            try:
+                item = r.payload.copy()
+                item['id'] = r.id
+                item['similarity_score'] = float(getattr(r, 'score', 0.0))
+                if not item.get('amount') or item.get('amount') == 0:
+                    calc = calculate_amount_from_attributes(item)
+                    if calc > 0:
+                        item['amount'] = calc
+                # Strict match: all extracted keywords must be present in item keywords
+                if strict_keywords:
+                    item_kws = set(str(k).lower() for k in (item.get('keywords') or []))
+                    if not all(k in item_kws for k in strict_keywords):
+                        continue
+                items.append(item)
+            except Exception as ex:
+                print("Vector result formatting error:", ex)
                 continue
         
-        # Filter items that contain any of the extracted keywords
-        filtered_items = []
-        for item in all_items:
-            # Check if item contains any of the keywords
-            item_text = ""
-            
-            # Combine all searchable text from the item
-            item_text += f" {item.get('item_name', '')}"
-            item_text += f" {item.get('room_name', '')}"
-            item_text += f" {item.get('area', '')}"
-            item_text += f" {item.get('project_name', '')}"
-            
-            # Add attributes
-            attrs_parsed = item.get('attributes_parsed', {})
-            if isinstance(attrs_parsed, dict):
-                for key, value in attrs_parsed.items():
-                    item_text += f" {value}"
-            
-            item_text = item_text.lower()
-            
-            # Check if ALL keywords match
-            keyword_matches = 0
-            for keyword in extracted_keywords:
-                if keyword in item_text:
-                    keyword_matches += 1
-            
-            # Only include items that have ALL keywords matching
-            if keyword_matches == len(extracted_keywords) and len(extracted_keywords) > 0:
-                item['keyword_matches'] = keyword_matches
-                filtered_items.append(item)
-        
-        # Now rank by vector similarity
-        if filtered_items:
-            vector = MODEL.encode(data.query).tolist()
-            
-            # Calculate similarity scores for filtered items
-            scored_items = []
-            for item in filtered_items:
-                try:
-                    # Create a text representation for vector encoding
-                    item_text = f"{item.get('item_name', '')} {item.get('room_name', '')} {item.get('area', '')}"
-                    attrs_parsed = item.get('attributes_parsed', {})
-                    if isinstance(attrs_parsed, dict):
-                        for key, value in attrs_parsed.items():
-                            item_text += f" {value}"
-                    
-                    # Encode the item text
-                    item_vector = MODEL.encode(item_text).tolist()
-                    
-                    # Calculate cosine similarity
-                    import numpy as np
-                    similarity = np.dot(vector, item_vector) / (np.linalg.norm(vector) * np.linalg.norm(item_vector))
-                    
-                    item['similarity_score'] = round(float(similarity), 4)
-                    scored_items.append(item)
-                except Exception as e:
-                    print(f"Error calculating similarity: {e}")
+        return {"results": items, "total_found": len(items)}
+    except Exception as e:
+        return {"results": [], "total_found": 0, "error": str(e)}
+
+@app.post("/search/vector")
+def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
+    """
+    Optimized semantic search using Qdrant vectors with optional keyword pre-filter.
+    - Extract top keywords from the query (KeyBERT over the same embedding model)
+    - Build a Qdrant payload filter on `keywords` if any exist
+    - Perform vector search using 384‑dim embeddings
+    - Post-process payloads to ensure computed fields (e.g., amount) are present
+    """
+    try:
+        query_text = (data.query or "").strip()
+        if not query_text:
+            return {"results": [], "query": data.query, "total_found": 0}
+
+        # 1) Build a local plan (can be replaced by external AI planner)
+        try:
+            kw_pairs = KW_MODEL.extract_keywords(query_text, keyphrase_ngram_range=(1, 2), stop_words='english')
+            attr_blacklist = {
+                "rate", "rate per sqft", "quantity", "price/unit", "price",
+                "measurement", "material", "finish", "description", "brand"
+            }
+            # Build ordered keyword list: include cleansed bigrams (if both tokens allowed)
+            # and include individual allowed tokens. Preserve order of appearance.
+            ordered: list[str] = []
+            seen: set[str] = set()
+
+            def add_term(term: str):
+                t = term.strip().lower()
+                if not t or t in seen:
+                    return
+                seen.add(t)
+                ordered.append(t)
+
+            for kw, _score in kw_pairs:
+                if not isinstance(kw, str) or not kw.strip():
                     continue
-            
-            # Sort by similarity score (highest first)
-            scored_items.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-            items = scored_items
-        else:
-            items = []
+                toks = re.findall(r"\b\w+\b", kw.lower())
+                toks = [t for t in toks if t not in attr_blacklist]
+                if len(toks) >= 2:
+                    bigram = " ".join(toks[:2])
+                    add_term(bigram)
+                for t in toks:
+                    add_term(t)
+
+            keywords = ordered
+        except Exception:
+            keywords = []
+
+        plan = VectorPlan(embedding_text=query_text, keywords=keywords, top_k=getattr(data, 'top_k', 10))
+
+        # 2) Execute plan via shared executor
+        exec_res = execute_vector_plan(plan)
+
+        return {
+            "results": exec_res.get("results", []),
+            "query": data.query,
+            "total_found": exec_res.get("total_found", 0),
+            "search_type": "vector_similarity_with_keywords",
+            "extracted_keywords": keywords
+        }
+    except Exception as e:
+        return {"results": [], "error": str(e), "total_found": 0}
+
+
+@app.post("/search/vector/prompt")
+def get_vector_search_prompt(data: NLPSearchQuery) -> Dict[str, Any]:
+    """Builds and returns a prebuilt AI prompt to plan the retrieval for a given query."""
+    q = (data.query or "").strip()
+    prompt = build_retrieval_prompt(q, top_k=getattr(data, 'top_k', 10) or 10)
+    # Also provide baseline keywords we computed locally (optional)
+    try:
+        kw_pairs = KW_MODEL.extract_keywords(q, keyphrase_ngram_range=(1, 2), stop_words='english')
+        keywords = [kw for kw, _ in kw_pairs]
+    except Exception:
+        keywords = []
+    return {"prompt": prompt, "baseline_keywords": keywords}
+
+
+@app.post("/search/vector/by-plan")
+def search_with_vector_plan(plan: VectorPlan) -> Dict[str, Any]:
+    """
+    Executes a search using a plan produced by an external AI:
+    - Embeds plan.embedding_text
+    - Filters by plan.keywords (keywords ANY) if provided
+    - Searches Qdrant and returns results
+    """
+    try:
+        embed_text = (plan.embedding_text or "").strip()
+        if not embed_text:
+            return {"results": [], "total_found": 0, "error": "empty embedding_text"}
+
+        query_vector = MODEL.encode(embed_text).tolist()
+
+        q_filter = None
+        if plan.keywords:
+            try:
+                q_filter = Filter(must=[FieldCondition(key="keywords", match=MatchAny(any=plan.keywords))])
+            except Exception:
+                q_filter = None
+
+        raw = client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=max(1, min(50, getattr(plan, 'top_k', 10) or 10)),
+            query_filter=q_filter
+        )
+
+        items: List[Dict[str, Any]] = []
+        for r in raw:
+            try:
+                item = r.payload.copy()
+                item['id'] = r.id
+                item['similarity_score'] = float(getattr(r, 'score', 0.0))
+                if not item.get('amount') or item.get('amount') == 0:
+                    calc = calculate_amount_from_attributes(item)
+                    if calc > 0:
+                        item['amount'] = calc
+                items.append(item)
+            except Exception as ex:
+                print("Vector result formatting error:", ex)
+                continue
         
         return {
             "results": items,
-            "query": data.query,
-            "total_found": len(items),
-            "search_type": "keyword_first_vector_similarity",
-            "extracted_keywords": extracted_keywords
+            "embedding_text": plan.embedding_text,
+            "keywords": plan.keywords,
+            "total_found": len(items)
         }
     except Exception as e:
-        print(f"Error in vector search: {e}")
         return {"results": [], "error": str(e), "total_found": 0}
 
 
