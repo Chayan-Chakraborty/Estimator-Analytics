@@ -924,6 +924,12 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
         for item in exec_res.get("results", []):
             formatted_item = {
                 "id": item.get("id"),
+                "area": item.get("area"),
+                "project_name": item.get("project_name"),
+                "room_name": item.get("room_name"),
+                "item_identifier": item.get("item_identifier"),
+                "description": item.get("description"),
+                "keywords": item.get("keywords"),
                 "score": round(item.get("similarity_score", 0.0), 3),
                 "item_name": item.get("item_name"),
                 "attributes_parsed": item.get("attributes_parsed", {}),
