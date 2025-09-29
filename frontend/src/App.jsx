@@ -6,8 +6,6 @@ import VoiceSearchDashboard from "./VoiceSearchDashboard";
 function App() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
-  const [page, setPage] = useState(1);
-  const [pageSize] = useState(12);
   const [isSearching, setIsSearching] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [selectedItem, setSelectedItem] = useState(null);
@@ -46,12 +44,6 @@ function App() {
   const [detectedVoiceLanguage, setDetectedVoiceLanguage] = useState("");
 
   const recognitionRef = useRef(null);
-  // Custom mic recording (device picker) state
-  const [audioDevices, setAudioDevices] = useState([]);
-  const [selectedMicId, setSelectedMicId] = useState("");
-  const [isRecording, setIsRecording] = useState(false);
-  const mediaRecorderRef = useRef(null);
-  const mediaStreamRef = useRef(null);
 
   const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
 
@@ -190,73 +182,9 @@ function App() {
     if (transcript) setQuery(transcript);
   }, [transcript]);
 
-  // Enumerate audio input devices
-  useEffect(() => {
-    const loadDevices = async () => {
-      try {
-        if (!navigator.mediaDevices?.enumerateDevices) return;
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const auds = devices.filter(d => d.kind === 'audioinput');
-        setAudioDevices(auds);
-        if (auds.length > 0 && !selectedMicId) setSelectedMicId(auds[0].deviceId);
-      } catch (e) {
-        // ignore
-      }
-    };
-    loadDevices();
-  }, [selectedMicId]);
-
-  // Start/Stop recording with selected device and send to backend STT
-  const startRecording = async () => {
-    try {
-      const constraints = { audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      mediaStreamRef.current = stream;
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-      const chunks = [];
-      recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-      recorder.onstop = async () => {
-        try {
-          const blob = new Blob(chunks, { type: 'audio/webm' });
-          const form = new FormData();
-          form.append('audio', blob, 'recording.webm');
-          const res = await axios.post(`${BACKEND_URL}/speech/query`, form, { headers: { 'Content-Type': 'multipart/form-data' } });
-          const english = res?.data?.english_query || '';
-          if (english) {
-            setQuery(english);
-            handleSearch(1);
-          }
-        } catch (err) {
-          setError(`Voice processing failed: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`);
-        } finally {
-          // cleanup stream
-          if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach(t => t.stop());
-            mediaStreamRef.current = null;
-          }
-          mediaRecorderRef.current = null;
-          setIsRecording(false);
-        }
-      };
-      recorder.start(200);
-      setIsRecording(true);
-    } catch (e) {
-      setError(`Unable to start recording: ${e?.message || e}`);
-      setIsRecording(false);
-    }
-  };
-
-  const stopRecording = () => {
-    try {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-      }
-    } catch (_) {}
-  };
 
   // Perform search using NLP or Vector endpoint based on toggle
-  const handleSearch = async (newPage = page) => {
+  const handleSearch = async () => {
     setIsSearching(true);
     setError("");
     setResults([]);
@@ -302,9 +230,7 @@ function App() {
           query: finalQuery,
           source_language: sourceLanguage || null,
           target_language: "en",
-          use_nlp: useNLP,
-          page: newPage,
-          page_size: pageSize
+          use_nlp: useNLP
         };
       } else {
         // Use regular endpoints
@@ -394,11 +320,6 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedItem, filters]);
 
-  // Re-run search if page changes and query exists
-  useEffect(() => {
-    if (query.trim()) handleSearch(page);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
 
   const handleIngest = async () => {
     setIsIngesting(true);
@@ -618,28 +539,6 @@ function App() {
           </button>
           <button onClick={handleIngest} style={buttonStyle} disabled={isIngesting}>
             {isIngesting ? "Ingesting..." : "Ingest Data"}
-          </button>
-          {/* Mic device picker */}
-          <select
-            value={selectedMicId}
-            onChange={(e) => setSelectedMicId(e.target.value)}
-            style={{ ...buttonStyle, background: "#ffffff", color: "#111827" }}
-            title="Select microphone device"
-          >
-            {audioDevices.length === 0 && (
-              <option value="">No microphones found</option>
-            )}
-            {audioDevices.map(d => (
-              <option key={d.deviceId} value={d.deviceId}>{d.label || `Mic ${d.deviceId.slice(0,6)}`}</option>
-            ))}
-          </select>
-          {/* Record to backend */}
-          <button
-            onClick={() => (isRecording ? stopRecording() : startRecording())}
-            style={{ ...buttonStyle, background: isRecording ? "#dc2626" : "#0ea5e9" }}
-            title="Record using selected microphone and transcribe on server"
-          >
-            {isRecording ? "Stop Rec" : "Record"}
           </button>
         </div>
       </div>
@@ -1016,28 +915,6 @@ function App() {
           </div>
         )}
 
-        {/* Pagination Info */}
-        {results.length > 0 && (
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 8px" }}>
-            <div style={{ color: "#6b7280" }}>{`Page ${page}`}</div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                onClick={() => page > 1 && setPage(page - 1)}
-                style={buttonStyle}
-                disabled={page === 1 || isSearching}
-              >
-                Prev
-              </button>
-              <button
-                onClick={() => setPage(page + 1)}
-                style={buttonStyle}
-                disabled={isSearching || results.length < pageSize}
-              >
-                Next
-              </button>
-            </div>
-          </div>
-        )}
 
         {/* Empty state */}
         {!isSearching && !error && results.length === 0 && (
