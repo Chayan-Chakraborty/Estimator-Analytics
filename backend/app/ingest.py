@@ -165,10 +165,25 @@ def ingest_to_qdrant():
                 toks = re.findall(r"\b\w+\b", kl)
                 return all(tok not in attr_blacklist for tok in toks)
 
-            keywords = sorted({
+            # Extract keywords from KeyBERT
+            extracted_keywords = sorted({
                 kw.strip().lower() for kw, _ in raw_keywords
                 if isinstance(kw, str) and allowed_phrase(kw)
             })
+            
+            # Ensure important words from item_name are always included
+            item_name_words = re.findall(r'\b\w+\b', item_name.lower())
+            for word in item_name_words:
+                if len(word) > 2 and word not in attr_blacklist:
+                    extracted_keywords.append(word)
+            
+            # Also include important words from room_name
+            room_name_words = re.findall(r'\b\w+\b', room_name.lower())
+            for word in room_name_words:
+                if len(word) > 2 and word not in attr_blacklist:
+                    extracted_keywords.append(word)
+            
+            keywords = sorted(set(extracted_keywords))
         except Exception:
             keywords = []
 

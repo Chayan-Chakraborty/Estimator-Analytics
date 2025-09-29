@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import SpeechRecognition, { useSpeechRecognition } from "react-speech-recognition";
 import axios from "axios";
+import VoiceSearchDashboard from "./VoiceSearchDashboard";
 
 function App() {
   const [query, setQuery] = useState("");
@@ -28,7 +29,7 @@ function App() {
   const [showSidebar, setShowSidebar] = useState(false);
   const [filteredResults, setFilteredResults] = useState([]);
   const [isFiltering, setIsFiltering] = useState(false);
-  const [viewMode, setViewMode] = useState("cards"); // "cards" or "table"
+  const [viewMode, setViewMode] = useState("cards"); // "cards", "table", or "voice"
   const [useNLP, setUseNLP] = useState(true);
   const [extractedFilters, setExtractedFilters] = useState({});
 
@@ -599,10 +600,14 @@ function App() {
             {showSidebar ? "Hide Filters" : "Show Filters"}
           </button>
           <button
-            onClick={() => setViewMode(viewMode === "cards" ? "table" : "cards")}
+            onClick={() => {
+              if (viewMode === "cards") setViewMode("table");
+              else if (viewMode === "table") setViewMode("voice");
+              else setViewMode("cards");
+            }}
             style={{ ...buttonStyle, background: "#059669" }}
           >
-            {viewMode === "cards" ? "Table View" : "Card View"}
+            {viewMode === "cards" ? "Table View" : viewMode === "table" ? "Voice Search" : "Card View"}
           </button>
           <button
             onClick={() => setUseMultilingual(!useMultilingual)}
@@ -856,7 +861,8 @@ function App() {
           </div>
         )}
 
-        {/* Search bar */}
+        {/* Search bar - hidden in voice mode */}
+        {viewMode !== "voice" && (
         <div style={{
           display: "flex",
           alignItems: "center",
@@ -921,6 +927,7 @@ function App() {
             {isSearching ? "Searching..." : (useMultilingual ? "🌍 Search" : "Search")}
           </button>
         </div>
+        )}
 
         {/* Auto Language Detection Status */}
         <div style={{
@@ -965,8 +972,8 @@ function App() {
           </div>
         )} */}
 
-        {/* Extracted Filters Display */}
-        {useNLP && Object.keys(extractedFilters).length > 0 && (
+        {/* Extracted Filters Display - hidden in voice mode */}
+        {viewMode !== "voice" && useNLP && Object.keys(extractedFilters).length > 0 && (
           <div style={{
             background: "#f0f9ff",
             border: "1px solid #0ea5e9",
@@ -1038,6 +1045,9 @@ function App() {
             No results yet. Try a search.
           </div>
         )}
+
+        {/* Voice Search Dashboard */}
+        {viewMode === "voice" && <VoiceSearchDashboard />}
 
         {/* Results Display */}
         {viewMode === "cards" ? (

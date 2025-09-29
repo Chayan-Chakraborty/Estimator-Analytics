@@ -21,3 +21,7 @@ transformers
 sentencepiece
 torch
 keybert
+# Voice search dependencies
+opencv-python
+librosa
+numpy

@@ -23,7 +23,8 @@ from app.speech_processor import process_speech_to_english_query, process_text_t
 from app.ai_layer import intelligent_translate
 from transformers import pipeline
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP
-from qdrant_client import QdrantClient
+from app.workers.stt import transcribe_audio
+from app.workers.translate import translate_to_english, translate_with_confidence
 
 zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -772,10 +773,36 @@ def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
                     calc = calculate_amount_from_attributes(item)
                     if calc > 0:
                         item['amount'] = calc
-                # Strict match: all extracted keywords must be present in item keywords
+                # Precise keyword matching: ALL keywords must have some match
                 if strict_keywords:
                     item_kws = set(str(k).lower() for k in (item.get('keywords') or []))
-                    if not all(k in item_kws for k in strict_keywords):
+                    item_text = f"{item.get('item_name', '')} {item.get('room_name', '')} {item.get('area', '')}"
+                    attrs_parsed = item.get('attributes_parsed', {})
+                    if isinstance(attrs_parsed, dict):
+                        for key, value in attrs_parsed.items():
+                            item_text += f" {value}"
+                    item_text = item_text.lower()
+                    
+                    # Check if ALL keywords have some match in item
+                    all_keywords_match = True
+                    for extracted_kw in strict_keywords:
+                        keyword_found = False
+                        # Check in keywords list
+                        for item_kw in item_kws:
+                            if (extracted_kw == item_kw or 
+                                extracted_kw in item_kw or 
+                                item_kw in extracted_kw):
+                                keyword_found = True
+                                break
+                        # Check in full text if not found in keywords
+                        if not keyword_found and extracted_kw in item_text:
+                            keyword_found = True
+                        
+                        if not keyword_found:
+                            all_keywords_match = False
+                            break
+                    
+                    if not all_keywords_match:
                         continue
                 items.append(item)
             except Exception as ex:
@@ -785,6 +812,59 @@ def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
         return {"results": items, "total_found": len(items)}
     except Exception as e:
         return {"results": [], "total_found": 0, "error": str(e)}
+
+@app.post("/search/voice")
+async def search_voice(file: UploadFile = File(...)):
+    """
+    Voice search endpoint: audio → text → translation → vector search.
+    
+    Pipeline:
+    1. Transcribe audio to text using faster-whisper
+    2. Detect language and translate to English if needed
+    3. Perform vector search with translated text
+    4. Return results with transcription and translation info
+    """
+    try:
+        # Step 1: Transcribe audio to text
+        transcribed_text = transcribe_audio(file)
+        
+        if not transcribed_text or not transcribed_text.strip():
+            raise HTTPException(status_code=400, detail="No speech detected in audio")
+        
+        # Step 2: Translate to English if needed
+        translated_text, detected_language, confidence = translate_with_confidence(transcribed_text)
+        
+        # Step 3: Perform vector search with translated text
+        search_data = NLPSearchQuery(query=translated_text, use_nlp=True)
+        search_results = search_with_vector_similarity(search_data)
+        
+        # Step 4: Format results
+        formatted_results = []
+        for item in search_results.get("results", []):
+            formatted_item = {
+                "id": item.get("id"),
+                "score": round(item.get("similarity_score", 0.0), 3),
+                "item_name": item.get("item_name"),
+                "attributes_parsed": item.get("attributes_parsed", {}),
+                "image": item.get("image"),
+                "amount": str(item.get("amount", "0.00"))
+            }
+            formatted_results.append(formatted_item)
+        
+        return {
+            "query_transcribed": transcribed_text,
+            "query_translated": translated_text,
+            "detected_language": detected_language,
+            "translation_confidence": confidence,
+            "results": formatted_results,
+            "total_found": len(formatted_results)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Voice search failed: {str(e)}")
+
 
 @app.post("/search/vector")
 def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
@@ -839,10 +919,23 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
         # 2) Execute plan via shared executor
         exec_res = execute_vector_plan(plan)
 
+        # Format results to match the required format
+        formatted_results = []
+        for item in exec_res.get("results", []):
+            formatted_item = {
+                "id": item.get("id"),
+                "score": round(item.get("similarity_score", 0.0), 3),
+                "item_name": item.get("item_name"),
+                "attributes_parsed": item.get("attributes_parsed", {}),
+                "image": item.get("image"),
+                "amount": str(item.get("amount", "0.00"))
+            }
+            formatted_results.append(formatted_item)
+        
         return {
-            "results": exec_res.get("results", []),
             "query": data.query,
-            "total_found": exec_res.get("total_found", 0),
+            "results": formatted_results,
+            "total_found": len(formatted_results),
             "search_type": "vector_similarity_with_keywords",
             "extracted_keywords": keywords
         }
