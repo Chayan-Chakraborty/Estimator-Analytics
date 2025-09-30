@@ -283,7 +283,6 @@ function App() {
       });
 
       setResults(normalized);
-      setPage(newPage);
 
       // /search/nlp does not return area_stats
     } catch (e) {
@@ -302,9 +301,13 @@ function App() {
       setDetailsError("");
       setAreaAmountStats([]);
       try {
+        // Parse measurement string to number (supports both sqft and 4x4 format)
+        const measurementValue = parseMeasurement(filters.measurement);
+        
         const res = await axios.post(`${BACKEND_URL}/search/filtered-stats`, {
           item_name: selectedItem.item_name,
           city: filters.city || null,
+          measurement: measurementValue
         });
 
         const areaStats = res?.data?.area_stats || [];
@@ -439,13 +442,45 @@ function App() {
     setFilters(prev => ({ ...prev, [key]: value }));
   };
 
+  const parseMeasurement = (measurementStr) => {
+    if (!measurementStr || !measurementStr.trim()) {
+      return null;
+    }
+    
+    const str = measurementStr.trim().toLowerCase();
+    
+    // Handle 4x4 format (like "4x4", "3x3", "2x2")
+    if (str.includes('x')) {
+      const parts = str.split('x');
+      if (parts.length === 2) {
+        const width = parseFloat(parts[0]);
+        const length = parseFloat(parts[1]);
+        if (!isNaN(width) && !isNaN(length)) {
+          return width * length; // Convert to sqft
+        }
+      }
+    }
+    
+    // Handle direct sqft value
+    const directValue = parseFloat(str);
+    if (!isNaN(directValue)) {
+      return directValue;
+    }
+    
+    return null;
+  };
+
   const applyFilters = async () => {
     setIsFiltering(true);
     setError("");
     try {
+      // Parse measurement string to number (supports both sqft and 4x4 format)
+      const measurementValue = parseMeasurement(filters.measurement);
+      
       const res = await axios.post(`${BACKEND_URL}/search/filtered-stats/only`, {
         item_name: filters.itemName || null,
-        city: filters.city || null
+        city: filters.city || null,
+        measurement: measurementValue
       });
       // New endpoint returns only area_stats
       setFilteredResults([]);
@@ -644,7 +679,7 @@ function App() {
             <label style={{ display: "block", marginBottom: 4, fontWeight: 500 }}>Measurement (sqft)</label>
             <input
               type="text"
-              placeholder={useNLP ? "e.g., 120 or 50-100" : "Enter sqft or range (50-100)"}
+              placeholder={useNLP ? "e.g., 120, 4x4, or 3x3" : "Enter sqft (120) or dimensions (4x4)"}
               value={filters.measurement}
               onChange={(e) => handleFilterChange('measurement', e.target.value)}
               style={{

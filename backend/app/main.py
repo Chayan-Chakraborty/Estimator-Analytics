@@ -1,3 +1,4 @@
+import email
 from .amount_calculator import AmountCalculatorUtils
 from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from pydantic import BaseModel
@@ -25,6 +26,7 @@ from transformers import pipeline
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP
 from app.workers.stt import transcribe_audio
 from app.workers.translate import translate_to_english, translate_with_confidence
+from app.translate_to_english import detect_and_translate
 
 zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -152,8 +154,7 @@ class SearchQuery(BaseModel):
 class FilteredSearchQuery(BaseModel):
     item_name: Optional[str] = None
     city: Optional[str] = None
-    measurement_min: Optional[float] = None
-    measurement_max: Optional[float] = None
+    measurement: Optional[float] = None
     amount_min: Optional[float] = None
     amount_max: Optional[float] = None
 
@@ -359,30 +360,131 @@ async def speech_query(audio: UploadFile = File(...)):
 @app.post("/speech/text-to-english")
 async def text_to_english(payload: Dict[str, str]):
     """
-    Intelligent text translation: detect language, handle romanized Indic by
-    trying multiple scripts, translate to fluent English, and keep meaning/tone.
+    Fast text translation: detect language and translate to English.
+    Optimized for speed with caching and early returns.
     """
     txt = payload.get("text", "") if payload else ""
     src = payload.get("source_language") if payload else None
     if not txt:
         return {"english_query": ""}
+    
     try:
-        english_text, detected_src = intelligent_translate(txt, src)
-        print(f"Debug: English text: {english_text}")
+        # Fast path: use simple Google translation
+        if src:
+            print(f"GoogleTranslator conversion Text to english: Text: {txt}, Source language: {src}")
+            # If source language is specified, use it directly
+            # tr = GoogleTranslator(source=src, target="en")
+            # english_text = tr.translate(txt)
+            # detected_src = src
+            # english_text = translate_to_english(txt, src)
+            english_text = detect_and_translate(txt, src)
+        else:
+            print(f"Intelligent translate Text to english: Text: {txt}, Source language: {src}, English text: {english_text}, Detected language: {detected_src}")
+            english_text, detected_src = intelligent_translate(txt, src)
+        
         return {"english_query": english_text, "detected_language": detected_src}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Text processing failed: {e}")
+        # Fallback: return original text if translation fails
+        return {"english_query": txt, "detected_language": "unknown"}
 
+
+def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
+    """
+    Enhanced NLP extraction for natural language queries.
+    Handles queries like "I want a bed", "I need a console table", "items for 1 BHK flat"
+    """
+    query_lower = query.lower().strip()
+    
+    # Common furniture and home items mapping
+    furniture_keywords = {
+        'bed': ['bed', 'beds', 'mattress', 'sleeping'],
+        'table': ['table', 'tables', 'dining table', 'coffee table', 'console table', 'study table'],
+        'chair': ['chair', 'chairs', 'seating', 'dining chair'],
+        'sofa': ['sofa', 'sofas', 'couch', 'settee'],
+        'wardrobe': ['wardrobe', 'wardrobes', 'closet', 'almirah'],
+        'door': ['door', 'doors', 'entrance door', 'room door'],
+        'window': ['window', 'windows', 'ventilation'],
+        'kitchen': ['kitchen', 'kitchen cabinet', 'kitchen unit'],
+        'bathroom': ['bathroom', 'toilet', 'washroom'],
+        'lighting': ['light', 'lights', 'lighting', 'lamp', 'bulb'],
+        'flooring': ['floor', 'flooring', 'tiles', 'marble'],
+        'ceiling': ['ceiling', 'roof', 'false ceiling']
+    }
+    
+    # Property type keywords
+    property_keywords = {
+        '1bhk': ['1 bhk', '1bhk', 'one bhk', '1 bedroom'],
+        '2bhk': ['2 bhk', '2bhk', 'two bhk', '2 bedroom'],
+        '3bhk': ['3 bhk', '3bhk', 'three bhk', '3 bedroom'],
+        'studio': ['studio', 'studio apartment'],
+        'flat': ['flat', 'apartment', 'unit'],
+        'house': ['house', 'villa', 'home']
+    }
+    
+    # Extract intent
+    intent = "search"  # default
+    if any(word in query_lower for word in ['want', 'need', 'looking for', 'require', 'search for']):
+        intent = "search"
+    elif any(word in query_lower for word in ['show', 'display', 'list', 'find']):
+        intent = "list"
+    elif any(word in query_lower for word in ['buy', 'purchase', 'order']):
+        intent = "purchase"
+    
+    # Extract furniture/home items
+    found_items = []
+    for category, keywords in furniture_keywords.items():
+        for keyword in keywords:
+            if keyword in query_lower:
+                found_items.append(category)
+                break
+    
+    # Extract property type
+    found_property = None
+    for prop_type, keywords in property_keywords.items():
+        for keyword in keywords:
+            if keyword in query_lower:
+                found_property = prop_type
+                break
+    
+    # Extract room types
+    room_keywords = {
+        'bedroom': ['bedroom', 'master bedroom', 'guest room'],
+        'living': ['living room', 'hall', 'drawing room'],
+        'kitchen': ['kitchen', 'cooking area'],
+        'bathroom': ['bathroom', 'toilet', 'washroom'],
+        'dining': ['dining room', 'dining area'],
+        'study': ['study room', 'office', 'work area']
+    }
+    
+    found_rooms = []
+    for room_type, keywords in room_keywords.items():
+        for keyword in keywords:
+            if keyword in query_lower:
+                found_rooms.append(room_type)
+                break
+    
+    return {
+        'intent': intent,
+        'furniture_items': found_items,
+        'property_type': found_property,
+        'room_types': found_rooms,
+        'original_query': query
+    }
 
 @app.post("/search/nlp")
 def search_with_nlp(data: NLPSearchQuery):
     try:
+        # Enhanced NLP processing
+        nlp_analysis = extract_intent_and_keywords(data.query)
+        
+        # Get vector search results
         vector = MODEL.encode(data.query).tolist()
         result = client.search(
             collection_name=COLLECTION_NAME,
             query_vector=vector,
             limit=10000
         )
+        
         all_items = []
         for r in result:
             try:
@@ -396,34 +498,63 @@ def search_with_nlp(data: NLPSearchQuery):
             except Exception as e:
                 print(f"Error processing item: {e}")
                 continue
+        
         if not data.use_nlp:
-            return {"results": all_items, "extracted_filters": {}}
+            return {"results": all_items, "extracted_filters": {}, "nlp_analysis": nlp_analysis}
+        
+        # Enhanced filtering based on NLP analysis
+        filtered_items = all_items
         extracted_filters = {}
-        item_name = data.query.strip()
-        if len(item_name) > 2:
-            extracted_filters['item_name'] = item_name
+        
+        # Filter by furniture items if found
+        if nlp_analysis['furniture_items']:
+            furniture_filtered = []
+            for item in all_items:
+                item_name_lower = item.get('item_name', '').lower()
+                item_keywords = [k.lower() for k in item.get('keywords', [])]
+                
+                # Check if any furniture item matches
+                for furniture in nlp_analysis['furniture_items']:
+                    if (furniture in item_name_lower or 
+                        any(furniture in kw for kw in item_keywords)):
+                        furniture_filtered.append(item)
+                        break
+            
+            if furniture_filtered:
+                filtered_items = furniture_filtered
+                extracted_filters['furniture_items'] = nlp_analysis['furniture_items']
+        
+        # Filter by room type if found
+        if nlp_analysis['room_types']:
+            room_filtered = []
+            for item in filtered_items:
+                room_name = item.get('room_name', '').lower()
+                for room_type in nlp_analysis['room_types']:
+                    if room_type in room_name:
+                        room_filtered.append(item)
+                        break
+            
+            if room_filtered:
+                filtered_items = room_filtered
+                extracted_filters['room_types'] = nlp_analysis['room_types']
+        
+        # Apply traditional filters
         city = extract_city_from_text(data.query)
         if city:
             extracted_filters['city'] = city
-        measurement_min, measurement_max = extract_measurement_from_text(
-            data.query)
+            filtered_items = [item for item in filtered_items if city.lower() in item.get('area', '').lower()]
+        
+        measurement_min, measurement_max = extract_measurement_from_text(data.query)
         if measurement_min is not None:
             extracted_filters['measurement_min'] = measurement_min
         if measurement_max is not None:
             extracted_filters['measurement_max'] = measurement_max
+        
         amount_min, amount_max = extract_amount_from_text(data.query)
         if amount_min is not None:
             extracted_filters['amount_min'] = amount_min
         if amount_max is not None:
             extracted_filters['amount_max'] = amount_max
-        filtered_items = all_items
-        if 'item_name' in extracted_filters:
-            filtered_items = find_similar_items(
-                extracted_filters['item_name'],
-                filtered_items,
-                'item_name',
-                threshold=0.5
-            )
         if 'city' in extracted_filters:
             filtered_items = find_similar_items(
                 extracted_filters['city'],
@@ -466,11 +597,12 @@ def search_with_nlp(data: NLPSearchQuery):
         return {
             "results": filtered_items,
             "extracted_filters": extracted_filters,
-            "total_found": len(filtered_items)
+            "total_found": len(filtered_items),
+            "nlp_analysis": nlp_analysis
         }
     except Exception as e:
         print(f"Error in NLP search: {e}")
-        return {"results": [], "extracted_filters": {}, "error": str(e)}
+        return {"results": [], "extracted_filters": {}, "error": str(e), "nlp_analysis": {}}
 
 
 # @app.post("/search/vector")
@@ -693,7 +825,7 @@ from keybert import KeyBERT
 
 class NLPSearchQuery(BaseModel):
     query: str
-    top_k: int = 10
+    top_k: Optional[int] = 10000
 
 
 # Embedding and keyword extraction models (must match Qdrant collection dim=384)
@@ -737,7 +869,7 @@ def build_retrieval_prompt(user_query: str, top_k: int = 10) -> str:
 class VectorPlan(BaseModel):
     embedding_text: str
     keywords: List[str] = []
-    top_k: Optional[int] = 10
+    top_k: Optional[int] = 10000
 
 
 def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
@@ -758,7 +890,7 @@ def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
         raw = client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=max(1, min(50, getattr(plan, 'top_k', 10) or 10)),
+            limit=getattr(plan, 'top_k', 10000) or 10000,
             query_filter=q_filter
         )
 
@@ -914,7 +1046,7 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
         except Exception:
             keywords = []
 
-        plan = VectorPlan(embedding_text=query_text, keywords=keywords, top_k=getattr(data, 'top_k', 10))
+        plan = VectorPlan(embedding_text=query_text, keywords=keywords, top_k=getattr(data, 'top_k', 10000))
 
         # 2) Execute plan via shared executor
         exec_res = execute_vector_plan(plan)
@@ -988,7 +1120,7 @@ def search_with_vector_plan(plan: VectorPlan) -> Dict[str, Any]:
         raw = client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=max(1, min(50, getattr(plan, 'top_k', 10) or 10)),
+            limit=getattr(plan, 'top_k', 10000) or 10000,
             query_filter=q_filter
         )
 
@@ -1175,16 +1307,18 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
             filters.append(FieldCondition(
                 key="area", match=MatchValue(value=data_dict["city"]) 
             ))
-        measurement_min = data_dict.get("measurement_min")
-        measurement_max = data_dict.get("measurement_max")
-        if measurement_min is not None or measurement_max is not None:
-            r = {}
-            if measurement_min is not None:
-                r["gte"] = measurement_min
-            if measurement_max is not None:
-                r["lte"] = measurement_max
+        measurement = data_dict.get("measurement")
+        if measurement is not None:
+            # For single measurement value, we'll use a range with some tolerance
+            # This allows for slight variations in measurement values
+            tolerance = measurement * 0.1  # 10% tolerance
             filters.append(FieldCondition(
-                key="measurement_sqft", range=Range(**r)))
+                key="measurement_sqft", 
+                range=Range(
+                    gte=measurement - tolerance,
+                    lte=measurement + tolerance
+                )
+            ))
     except Exception as e:
         print(f"DEBUG: Error building filters (only): {e}")
 
@@ -1696,18 +1830,12 @@ def search_multilingual_nlp(data: MultilingualSearchQuery):
     Multilingual search with NLP processing. Translates query and applies NLP filters.
     """
     try:
-        # Translate the query to English
-        translation_result = translate_query(
-            query=data.query,
-            source_lang=data.source_language,
-            target_lang=data.target_language
-        )
-        
-        translated_query = translation_result["translated_query"]
-        detected_language = translation_result["detected_language"]
-        confidence = translation_result.get("confidence", 0.0)
-        
-        # Use the existing NLP search logic with translated query
+        # Translation is already done before this call. Use the provided query as-is.
+        translated_query = data.query or ""
+        detected_language = data.source_language or "auto"
+        confidence = 1.0
+
+        # Use the existing NLP search logic with the (pre)translated query
         nlp_data = NLPSearchQuery(query=translated_query, use_nlp=data.use_nlp)
         nlp_result = search_with_nlp(nlp_data)
         

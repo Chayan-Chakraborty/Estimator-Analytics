@@ -1,6 +1,7 @@
 from transformers import pipeline
+from typing import Optional
 
-def detect_and_translate(text: str) -> str:
+def detect_and_translate(text: str, source_language: Optional[str] = None) -> str:
     """
     Detects the language of the input text (including Hinglish/code-mixed)
     and translates it into natural English.
@@ -11,12 +12,13 @@ def detect_and_translate(text: str) -> str:
     translator = pipeline(
         "translation",
         model="facebook/nllb-200-distilled-600M",
-        src_lang="auto",    # let model auto-detect the source language
-        tgt_lang="eng_Latn" # translate to English
+        src_lang=source_language or "auto",
+        tgt_lang="eng_Latn" 
     )
 
     # Translate text
     result = translator(text, max_length=512)
+    print(f"Detect and translate: Text: {text}, Source language: {source_language}, Result: {result[0]['translation_text']}")
     return result[0]['translation_text']
 
 if __name__ == "__main__":
