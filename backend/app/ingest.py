@@ -7,7 +7,6 @@ import os
 from uuid import uuid4
 import json
 import re
-from app.translations_loader import generate_flat_keywords
 
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 KW_MODEL = KeyBERT(model=MODEL)
@@ -176,7 +175,7 @@ def ingest_to_qdrant():
             })
             
             # keywords = generate_flat_keywords(list(extracted_keywords))
-            keywords = list(generate_flat_keywords(list(extracted_keywords)))
+            keywords = list(list(extracted_keywords))
             print("keywords: ------------------------------------------- ", keywords)
         except Exception:
             keywords = []

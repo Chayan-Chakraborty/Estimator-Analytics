@@ -1,11 +1,9 @@
 import unicodedata
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from keybert import KeyBERT
-import email
 from .amount_calculator import AmountCalculatorUtils
-from fastapi import FastAPI, Query, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
 import sys
 import os
 import re
@@ -42,26 +40,40 @@ if _WORKSPACE_ROOT not in sys.path:
 
 # Multilingual item extractor: synonym index for query -> item_name (lazy-loaded)
 _SYNONYM_INDEX = None
-_ITEM_JSON_PATH = os.environ.get(
-    "ITEM_SYNONYM_JSON_PATH",
-    os.path.join(_WORKSPACE_ROOT, "multilingual_item_extractor", "item1.json"),
-)
+# Follow multilingual_item_extractor/demo.py:
+# - load item synonyms JSON (items.json)
+# - build synonym index
+# - extract canonical item_name
+#
+# In Docker, only `backend/app/` is copied, so we default to `app/items.json`.
+# In the dev workspace, we also fall back to `multilingual_item_extractor/item1.json`.
+_ITEM_JSON_PATH = os.environ.get("ITEM_SYNONYM_JSON_PATH")
+if not _ITEM_JSON_PATH:
+    _candidates = [
+        os.path.join(_APP_DIR, "items.json"),
+        os.path.join(_WORKSPACE_ROOT, "multilingual_item_extractor", "item1.json"),
+    ]
+    _ITEM_JSON_PATH = next((p for p in _candidates if os.path.isfile(p)), _candidates[0])
 
 
 def _get_synonym_index():
-    """Load item synonym JSON and build index once (from multilingual_item_extractor)."""
+    """Load item synonym JSON and build index once (demo.py style)."""
     global _SYNONYM_INDEX
     if _SYNONYM_INDEX is not None:
         return _SYNONYM_INDEX
     try:
         import json
-        from multilingual_item_extractor.extractor import build_synonym_index
-        if os.path.isfile(_ITEM_JSON_PATH):
-            with open(_ITEM_JSON_PATH, "r", encoding="utf-8") as f:
-                item_json = json.load(f)
-            _SYNONYM_INDEX = build_synonym_index(item_json)
-        else:
+        from app.extractor import build_synonym_index
+
+        if not os.path.isfile(_ITEM_JSON_PATH):
+            print(f"⚠️ items.json not found at: {_ITEM_JSON_PATH}")
             _SYNONYM_INDEX = {}
+            return _SYNONYM_INDEX
+
+        with open(_ITEM_JSON_PATH, "r", encoding="utf-8") as f:
+            item_json = json.load(f)
+
+        _SYNONYM_INDEX = build_synonym_index(item_json)
     except Exception as e:
         print("⚠️ Could not load multilingual item extractor synonym index:", e)
         _SYNONYM_INDEX = {}
@@ -69,18 +81,16 @@ def _get_synonym_index():
 
 
 def extract_item_name_from_query(query: str):
-    """Use multilingual_item_extractor to get canonical item_name for a query."""
+    """Demo.py flow: extract_item(query, synonym_index) -> canonical item_name."""
     index = _get_synonym_index()
     if not index:
         return None
     try:
-        from multilingual_item_extractor.extractor import extract_item
+        from app.extractor import extract_item
         return extract_item(query or "", index)
     except Exception:
         return None
 
-
-MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
 app = FastAPI()
 
@@ -454,10 +464,17 @@ async def speech_query(audio: UploadFile = File(...)):
         {"english_query": "..."}
     """
     try:
-        content = await audio.read()
-        english_text = process_speech_to_english_query(content)
+        # Use transcribe_audio from workers.stt to convert audio to text
+        transcribed_text = transcribe_audio(audio)
+        if not transcribed_text or not transcribed_text.strip():
+            raise HTTPException(
+                status_code=400, detail="No speech detected in audio")
+        # Translate to English if needed
+        english_text, _, _ = translate_with_confidence(transcribed_text)
         print(f"Debug: English text: {english_text}")
         return {"english_query": english_text}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400, detail=f"Speech processing failed: {e}")
@@ -479,16 +496,14 @@ async def text_to_english(payload: Dict[str, str]):
         if src:
             print(
                 f"GoogleTranslator conversion Text to english: Text: {txt}, Source language: {src}")
-            # If source language is specified, use it directly
-            # tr = GoogleTranslator(source=src, target="en")
-            # english_text = tr.translate(txt)
-            # detected_src = src
-            # english_text = translate_to_english(txt, src)
-            english_text = detect_and_translate(txt, src)
+            # If source language is specified, use translate_to_english
+            english_text = translate_to_english(txt, src)
+            detected_src = src
         else:
+            # Use intelligent_translate for auto-detection
+            english_text, detected_src = intelligent_translate(txt, src)
             print(
                 f"Intelligent translate Text to english: Text: {txt}, Source language: {src}, English text: {english_text}, Detected language: {detected_src}")
-            english_text, detected_src = intelligent_translate(txt, src)
 
         return {"english_query": english_text, "detected_language": detected_src}
     except Exception as e:
@@ -727,7 +742,18 @@ class NLPSearchQuery(BaseModel):
 
 
 # Embedding and keyword extraction models (must match Qdrant collection dim=384)
-MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+# Defensive imports: some deployments may run an older image where top-level imports differ.
+try:
+    SentenceTransformer  # type: ignore[name-defined]
+except NameError:  # pragma: no cover
+    from sentence_transformers import SentenceTransformer  # type: ignore[no-redef]
+
+try:
+    KeyBERT  # type: ignore[name-defined]
+except NameError:  # pragma: no cover
+    from keybert import KeyBERT  # type: ignore[no-redef]
+
+MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 KW_MODEL = KeyBERT(model=MODEL)
 
 
@@ -1099,139 +1125,147 @@ async def search_voice(file: UploadFile = File(...)):
 @app.post("/search/vector")
 def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
     """
-    Optimized multilingual semantic search using Qdrant vectors with optional keyword pre-filter.
-    - Extract top keywords from the query (KeyBERT for English, fallback for others)
-    - Detects and handles Bengali, Hindi, Tamil, Telugu, etc.
-    - Builds Qdrant payload filter on `keywords` if any exist
-    - Performs vector search using 384-dim embeddings
-    - Post-processes payloads to ensure computed fields (e.g., amount, average_price) are present
+    Simplified vector search using multilingual_item_extractor to get item_name and search Qdrant.
+    - Extracts item_name from query using multilingual_item_extractor
+    - Performs vector search in Qdrant filtered by item_name
+    - Returns results ranked by vector similarity
     """
-    import regex as re  # Unicode-aware regex
-    import unicodedata
-
-    def normalize_text(t: str) -> str:
-        """Normalize multilingual text to a consistent lowercase form."""
-        if not isinstance(t, str):
-            return ""
-        return unicodedata.normalize("NFKC", t).strip().lower()
-
-    def contains_non_latin(text: str) -> bool:
-        """Detect if the text contains any non-Latin (e.g., Bengali, Hindi, Tamil) characters."""
-        return bool(re.search(r"[^\p{Latin}]", text))
-
     try:
         query_text = (data.query or "").strip()
         if not query_text:
             return {"results": [], "query": data.query, "total_found": 0}
 
-        normalized_query = normalize_text(query_text)
-
-        # -------------------------------------------------------------
-        # 1️⃣ Keyword Extraction (Unicode + Multilingual Safe)
-        # -------------------------------------------------------------
-        try:
-            if contains_non_latin(normalized_query):
-                # Non-Latin text (Bengali, Hindi, etc.) — split by space only
-                keywords = [
-                    normalize_text(word)
-                    for word in normalized_query.split()
-                    if word.strip()
-                ]
-                print("🔠 Non-Latin detected, keywords:", keywords)
-            else:
-                # English or Latin script — use KeyBERT
-                kw_pairs = KW_MODEL.extract_keywords(
-                    normalized_query,
-                    keyphrase_ngram_range=(1, 2),
-                    stop_words='english'
-                )
-
-                if not kw_pairs:
-                    kw_pairs = [(normalized_query, 1.0)]
-
-                attr_blacklist = {
-                    "rate", "rate per sqft", "quantity", "price/unit", "price",
-                    "measurement", "material", "finish", "description", "brand"
-                }
-
-                ordered: list[str] = []
-                seen: set[str] = set()
-
-                def add_term(term: str):
-                    t = term.strip().lower()
-                    if not t or t in seen:
-                        return
-                    seen.add(t)
-                    ordered.append(t)
-
-                for kw, _score in kw_pairs:
-                    if not isinstance(kw, str) or not kw.strip():
-                        continue
-
-                    # Unicode-aware word extraction
-                    toks = re.findall(r"\p{L}+", kw.lower())
-                    toks = [t for t in toks if t not in attr_blacklist]
-
-                    if len(toks) >= 2:
-                        bigram = " ".join(toks[:2])
-                        add_term(bigram)
-
-                    for t in toks:
-                        add_term(t)
-
-                if not ordered:
-                    ordered = [normalized_query]
-
-                keywords = ordered
-                print("🔤 Latin detected, ordered keywords:", keywords)
-
-        except Exception as ex:
-            print("⚠️ Keyword extraction error:", ex)
-            keywords = [normalized_query]
-
-        # -------------------------------------------------------------
-        # 1b. Extract item_name from query (multilingual_item_extractor)
-        # -------------------------------------------------------------
+        # Extract item_name from query using multilingual_item_extractor
         extracted_item_name = extract_item_name_from_query(query_text)
 
-        # -------------------------------------------------------------
-        # 2️⃣ Build and Execute Vector Search Plan
-        # -------------------------------------------------------------
-        plan = VectorPlan(
-            embedding_text=query_text,
-            keywords=keywords,
-            top_k=getattr(data, 'top_k', 10000),
-            item_name=extracted_item_name,
-        )
+        print(f"Query text: ------------------------------- {query_text}")
+        print(f"Extracted item name: ------------------------------- {extracted_item_name}")
 
-        exec_res = execute_vector_plan(plan)
+        # Create vector embedding from query
+        query_vector = MODEL.encode(query_text).tolist()
 
-        # -------------------------------------------------------------
-        # 3️⃣ Format Results and Compute Averages
-        # -------------------------------------------------------------
+        # For maximum recall, we DON'T filter in Qdrant by item_name.
+        # Instead we run vector search over the whole collection and
+        # then post-filter results by whether item_name contains the
+        # extracted canonical name (or any of its comma-separated parts).
+        q_filter = None
+
+        # Search Qdrant (support multiple qdrant-client APIs)
+        top_k = getattr(data, "top_k", 10000) or 10000
+
+        raw_items = None
+        search_fn = getattr(client, "search", None)
+        if callable(search_fn):
+            raw_items = search_fn(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_vector,
+                limit=top_k,
+                query_filter=q_filter,
+            )
+
+        if raw_items is None:
+            search_points_fn = getattr(client, "search_points", None)
+            if callable(search_points_fn):
+                raw_items = search_points_fn(
+                    collection_name=COLLECTION_NAME,
+                    query_vector=query_vector,
+                    limit=top_k,
+                    query_filter=q_filter,
+                )
+
+        if raw_items is None:
+            # Newer clients expose `query_points`
+            query_points_fn = getattr(client, "query_points", None)
+            if callable(query_points_fn):
+                raw_items = query_points_fn(
+                    collection_name=COLLECTION_NAME,
+                    query=query_vector,
+                    query_filter=q_filter,
+                    limit=top_k,
+                    with_payload=True,
+                )
+                # query_points returns QueryResponse with `.points`
+                if hasattr(raw_items, "points"):
+                    raw_items = getattr(raw_items, "points")
+
+        if raw_items is None:
+            raise RuntimeError(
+                "Qdrant client does not expose search/search_points/query_points. "
+                "Please upgrade 'qdrant-client' in backend/requirements.txt."
+            )
+
+        # Format results
         all_formatted_results = []
-        for item in exec_res.get("results", []):
-            formatted_item = {
-                "id": item.get("id"),
-                "area": item.get("area"),
-                "project_name": item.get("project_name"),
-                "room_name": item.get("room_name"),
-                "item_identifier": item.get("item_identifier"),
-                "item_type_identifier": item.get("item_type_identifier"),
-                "description": item.get("description"),
-                "score": round(item.get("similarity_score", 0.0), 3),
-                "item_name": item.get("item_name"),
-                "attributes_parsed": item.get("attributes_parsed", {}),
-                "image": item.get("image"),
-                "amount": str(item.get("amount", "0.00"))
-            }
-            all_formatted_results.append(formatted_item)
+        for r in raw_items:
+            try:
+                item = getattr(r, "payload", r) if hasattr(r, "payload") else r.copy()
+                item["id"] = getattr(r, "id", None)
+                similarity = getattr(r, "score", None)
+                
+                formatted_item = {
+                    "id": item.get("id"),
+                    "area": item.get("area"),
+                    "project_name": item.get("project_name"),
+                    "room_name": item.get("room_name"),
+                    "item_identifier": item.get("item_identifier"),
+                    "item_type_identifier": item.get("item_type_identifier"),
+                    "description": item.get("description"),
+                    "score": round(similarity if similarity is not None else 0.0, 3),
+                    "item_name": item.get("item_name"),
+                    "attributes_parsed": item.get("attributes_parsed", {}),
+                    "image": item.get("image"),
+                    "amount": str(item.get("amount", "0.00"))
+                }
+                all_formatted_results.append(formatted_item)
+            except Exception as ex:
+                print(f"Item processing error: {ex}")
+                continue
 
-        # -------------------------------------------------------------
-        # 4️⃣ Compute Area-wise Average Price
-        # -------------------------------------------------------------
+        # If we have an extracted item name, (1) keep only items whose
+        # item_name CONTAINS any of the canonical names (case-insensitive),
+        # and (2) re-rank so exact matches for the canonical names come first,
+        # then strong word-boundary matches (e.g. "bed side table"), then
+        # weaker substring matches.
+        if extracted_item_name:
+            parts = [
+                p.strip().lower()
+                for p in str(extracted_item_name).split(",")
+                if p.strip()
+            ]
+            if parts:
+                filtered = []
+                for item in all_formatted_results:
+                    iname = (item.get("item_name") or "").strip().lower()
+                    if any(part in iname for part in parts):
+                        filtered.append(item)
+                # Only replace if we found at least one match; otherwise
+                # fall back to the original vector-ranked results.
+                if filtered:
+                    def _boost_score(it):
+                        base = float(it.get("score", 0.0))
+                        name = (it.get("item_name") or "").strip().lower()
+                        boost = 0.0
+                        for p in parts:
+                            if not p:
+                                continue
+                            if name == p:
+                                # Exact item ("bed")
+                                boost = max(boost, 2.0)
+                            else:
+                                # Word-boundary / prefix match ("bed side table")
+                                if name.startswith(p + " ") or (" " + p + " ") in name or name.endswith(" " + p):
+                                    boost = max(boost, 1.0)
+                                # Any substring ("storage for bed")
+                                elif p in name:
+                                    boost = max(boost, 0.5)
+                        return base + boost
+
+                    all_formatted_results = sorted(
+                        filtered, key=_boost_score, reverse=True
+                    )
+
+        # Compute Area-wise Average Price
         averages = calculate_area_wise_averages(all_formatted_results)
-
         for item in all_formatted_results:
             area = (item.get("area") or "").strip().lower()
             item_name = (item.get("item_name") or "").strip().lower()
@@ -1244,26 +1278,18 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
             else:
                 item["average_price"] = None
 
-        # -------------------------------------------------------------
-        # 5️⃣ Pagination
-        # -------------------------------------------------------------
+        # Pagination
         page = max(1, getattr(data, 'page', 1) or 1)
-        # Cap at 100 per page
         page_size = max(1, min(100, getattr(data, 'page_size', 20) or 20))
         total_count = len(all_formatted_results)
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
         paginated_results = all_formatted_results[start_idx:end_idx]
-        total_pages = (total_count + page_size -
-                       1) // page_size if total_count > 0 else 0
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 0
 
-        # -------------------------------------------------------------
-        # 6️⃣ Final Response
-        # -------------------------------------------------------------
+        # Final Response
         return {
             "query": data.query,
-            "normalized_query": normalized_query,
-            "keywords": keywords,
             "extracted_item_name": extracted_item_name,
             "results": paginated_results,
             "total_found": total_count,
@@ -1272,7 +1298,7 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
             "total_pages": total_pages,
             "has_next": page < total_pages,
             "has_previous": page > 1,
-            "search_type": "vector_similarity_with_keywords"
+            "search_type": "vector_search_with_item_extractor"
         }
 
     except Exception as e:

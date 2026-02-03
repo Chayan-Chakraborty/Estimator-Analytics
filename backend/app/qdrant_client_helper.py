@@ -9,6 +9,16 @@ COLLECTION_NAME = "items"
 
 client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
+# Compatibility shim for older qdrant-client versions.
+# Some versions expose `search_points()` instead of `search()`.
+if not hasattr(client, "search") and hasattr(client, "search_points"):
+    _search_points = getattr(client, "search_points")
+
+    def _search(*args, **kwargs):
+        return _search_points(*args, **kwargs)
+
+    setattr(client, "search", _search)
+
 def create_collection(vector_size=384):
     if COLLECTION_NAME not in [c.name for c in client.get_collections().collections]:
         client.recreate_collection(
