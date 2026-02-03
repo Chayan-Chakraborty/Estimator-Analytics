@@ -1275,21 +1275,46 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
                 continue
 
         # If we have an extracted item name, (1) keep only items whose
-        # item_name CONTAINS any of the canonical names (case-insensitive),
-        # and (2) re-rank so exact matches for the canonical names come first,
-        # then strong word-boundary matches (e.g. "bed side table"), then
-        # weaker substring matches.
+        # item_name CONTAINS any of the canonical names or their core tokens
+        # (case-insensitive), and (2) re-rank so exact matches for the
+        # canonical names come first, then strong word-boundary matches
+        # (e.g. "bed side table", "tv area wall panelling"), then weaker
+        # substring matches.
         if extracted_item_name:
-            parts = [
+            phrase_parts = [
                 p.strip().lower()
                 for p in str(extracted_item_name).split(",")
                 if p.strip()
             ]
-            if parts:
+            if phrase_parts:
+                # Core tokens derived from the canonical phrases.
+                token_parts_set = set()
+                for ph in phrase_parts:
+                    for tok in ph.split():
+                        if tok:
+                            token_parts_set.add(tok)
+
+                # Filter out very generic words so we don't match everything
+                # just because of "unit", "wall", etc.
+                generic_tokens = {
+                    "unit",
+                    "wall",
+                    "area",
+                    "base",
+                    "panel",
+                    "panelling",
+                    "storage",
+                }
+                core_tokens = [t for t in token_parts_set if t not in generic_tokens]
+
                 filtered = []
                 for item in all_formatted_results:
                     iname = (item.get("item_name") or "").strip().lower()
-                    if any(part in iname for part in parts):
+                    # Match if the full canonical phrase appears, OR
+                    # if any core token (like "tv", "bed", "cot") appears.
+                    if any(part in iname for part in phrase_parts) or any(
+                        tok in iname for tok in core_tokens
+                    ):
                         filtered.append(item)
                 # Only replace if we found at least one match; otherwise
                 # fall back to the original vector-ranked results.
@@ -1298,7 +1323,7 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
                         base = float(it.get("score", 0.0))
                         name = (it.get("item_name") or "").strip().lower()
                         boost = 0.0
-                        for p in parts:
+                        for p in phrase_parts:
                             if not p:
                                 continue
                             if name == p:
@@ -1311,6 +1336,11 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
                                 # Any substring ("storage for bed")
                                 elif p in name:
                                     boost = max(boost, 0.5)
+                        # Slight extra boost if any core token appears
+                        # (e.g. "tv area wall panelling" when canonical is "tv wall unit").
+                        for t in core_tokens:
+                            if t and t in name:
+                                boost = max(boost, boost + 0.25)
                         return base + boost
 
                     all_formatted_results = sorted(
