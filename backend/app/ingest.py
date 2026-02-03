@@ -7,6 +7,7 @@ import os
 from uuid import uuid4
 import json
 import re
+from app.translations_loader import generate_flat_keywords
 
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 KW_MODEL = KeyBERT(model=MODEL)
@@ -23,7 +24,7 @@ def fetch_data():
     )
     cur = conn.cursor()
     query = """SELECT e.id AS estimator_id, r.name AS room_name, i.name AS item_name, i.id, i.amount,
-           a.city AS area, p.name AS project_name, i.attributes, i.type_identifier as item_identifier,
+           a.city AS area, p.name AS project_name, i.attributes, i.type_identifier as item_type_identifier, i.identifier as item_identifier,
            e.user_id, i.image
     FROM vishanti.item i
     JOIN vishanti.room r ON r.id = i.room_id
@@ -123,7 +124,7 @@ def ingest_to_qdrant():
     create_collection()
     data = fetch_data()
     for row in data:
-        estimator_id, room_name, item_name, item_id, amount, area, project_name, attributes, item_identifier, user_id, image = row
+        estimator_id, room_name, item_name, item_id, amount, area, project_name, attributes, item_type_identifier, item_identifier, user_id, image = row
         # Qdrant expects point id as unsigned int or UUID
         try:
             point_id = int(item_id)
@@ -135,10 +136,13 @@ def ingest_to_qdrant():
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
 
+        # text = (
+        #     f"The material is {parsed_attrs.get('Material')} with a {parsed_attrs.get('Finish')} finish, "
+        #     f"priced at {parsed_attrs.get('Rate')}, and measuring {parsed_attrs.get('Measurement')}. "
+        #     f"{item_name} in {room_name} of {project_name}, located at {area}."
+        # )
         text = (
-            f"The material is {parsed_attrs.get('Material')} with a {parsed_attrs.get('Finish')} finish, "
-            f"priced at {parsed_attrs.get('Rate')}, and measuring {parsed_attrs.get('Measurement')}. "
-            f"{item_name} in {room_name} of {project_name}, located at {area}."
+             f"{item_name}  located at {area}."
         )
         vector = MODEL.encode(text).tolist()
 
@@ -171,19 +175,9 @@ def ingest_to_qdrant():
                 if isinstance(kw, str) and allowed_phrase(kw)
             })
             
-            # Ensure important words from item_name are always included
-            item_name_words = re.findall(r'\b\w+\b', item_name.lower())
-            for word in item_name_words:
-                if len(word) > 2 and word not in attr_blacklist:
-                    extracted_keywords.append(word)
-            
-            # Also include important words from room_name
-            room_name_words = re.findall(r'\b\w+\b', room_name.lower())
-            for word in room_name_words:
-                if len(word) > 2 and word not in attr_blacklist:
-                    extracted_keywords.append(word)
-            
-            keywords = sorted(set(extracted_keywords))
+            # keywords = generate_flat_keywords(list(extracted_keywords))
+            keywords = list(generate_flat_keywords(list(extracted_keywords)))
+            print("keywords: ------------------------------------------- ", keywords)
         except Exception:
             keywords = []
 
@@ -191,32 +185,27 @@ def ingest_to_qdrant():
         amount_to_store = amount
         try:
             if not amount_to_store or amount_to_store == 0:
-                type_identifier = None
-                if isinstance(item_identifier, str):
-                    if "WD" in item_identifier:
-                        type_identifier = "WD"
-                    elif "FC" in item_identifier:
-                        type_identifier = "FC"
-                    elif "ACS" in item_identifier:
-                        type_identifier = "ACS"
-                    elif "LF" in item_identifier:
-                        type_identifier = "LF"
-                    elif "OTH" in item_identifier:
-                        type_identifier = "OTH"
-                if type_identifier:
+                if item_type_identifier:
                     dummy_item = type("Item", (), {"attributes": attributes})()
-                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(item_type_identifier, dummy_item)
                     if calculated_amount and calculated_amount > 0:
                         amount_to_store = calculated_amount
         except Exception:
             # Swallow calculation errors and fall back to original amount
             pass
+
+        text_for_vector = (
+            f"The material is {parsed_attrs.get('Material')} with a {parsed_attrs.get('Finish')} finish, "
+            f"priced at {parsed_attrs.get('Rate')}, and measuring {parsed_attrs.get('Measurement')}. "
+            f"{item_name} in {room_name} of {project_name}, located at {area}. as keywords {keywords} with"
+        )
+        vector_for_vector = MODEL.encode(text_for_vector).tolist()
         client.upsert(
             collection_name=COLLECTION_NAME,
             points=[
                 {
                     "id": point_id,
-                    "vector": vector,
+                    "vector": vector_for_vector,
                     "payload": {
                         "estimator_id": estimator_id,
                         "room_name": room_name,
@@ -229,6 +218,7 @@ def ingest_to_qdrant():
                         "measurement_sqft": measurement_sqft,
                         "id": item_id,
                         "item_identifier": item_identifier,
+                        "item_type_identifier": item_type_identifier,
                         "image": image,
                         "keywords": keywords
                     }

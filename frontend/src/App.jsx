@@ -5,7 +5,16 @@ import VoiceSearchDashboard from "./VoiceSearchDashboard";
 
 function App() {
   const [query, setQuery] = useState("");
+  const [textQuery, setTextQuery] = useState("");
+  const [micQuery, setMicQuery] = useState("");
   const [results, setResults] = useState([]);
+  const [totalResultsCount, setTotalResultsCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [totalPages, setTotalPages] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [hasPrevious, setHasPrevious] = useState(false);
+  const [lastSearchType, setLastSearchType] = useState(null); // 'text' or 'mic'
   const [isSearching, setIsSearching] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [selectedItem, setSelectedItem] = useState(null);
@@ -73,10 +82,20 @@ function App() {
 
   // Calculate avg amount for same city and item_name
   const calculateAvgAmount = (currentItem, allItems) => {
-    const sameCityItemName = allItems.filter(item => 
-      item.area === currentItem.area && 
-      item.item_name === currentItem.item_name
-    );
+    if (!currentItem || !allItems || allItems.length === 0) return null;
+    
+    // Normalize area and item_name for case-insensitive matching
+    const normalize = (str) => (str || "").toString().trim().toLowerCase();
+    const currentArea = normalize(currentItem.area);
+    const currentItemName = normalize(currentItem.item_name);
+    
+    if (!currentArea || !currentItemName) return null;
+    
+    const sameCityItemName = allItems.filter(item => {
+      const itemArea = normalize(item.area);
+      const itemName = normalize(item.item_name);
+      return itemArea === currentArea && itemName === currentItemName;
+    });
     
     if (sameCityItemName.length <= 1) return null;
     
@@ -145,7 +164,7 @@ function App() {
 
       recognition.onresult = (event) => {
         const transcript = event.results[0][0].transcript;
-        setQuery(transcript);
+        setMicQuery(transcript);
         
         // Try to detect the language from the transcript
         if (event.results[0][0].confidence) {
@@ -179,7 +198,7 @@ function App() {
   }, [listening]);
 
   useEffect(() => {
-    if (transcript) setQuery(transcript);
+    if (transcript) setMicQuery(transcript);
   }, [transcript]);
 
 
@@ -285,6 +304,70 @@ function App() {
       setResults(normalized);
 
       // /search/nlp does not return area_stats
+    } catch (e) {
+      const message = e?.response?.data?.detail || e?.message || 'Unknown error';
+      setError(`Failed to fetch results: ${message}`);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Plain vector search for text input
+  const handleTextVectorSearch = async (page = null) => {
+    // page can be a number (for pagination) or null/undefined (for new search)
+    const targetPage = (typeof page === 'number' && page > 0) ? page : 1;
+    setIsSearching(true);
+    setError("");
+    setResults([]);
+    setCurrentPage(targetPage);
+    setLastSearchType('text');
+    try {
+      const res = await axios.post(`${BACKEND_URL}/search/vector`, {
+        query: String(textQuery || ""),
+        use_nlp: false,
+        is_voice: false,
+        page: targetPage,
+        page_size: pageSize
+      });
+      const raw = res?.data?.results;
+      const safeArray = Array.isArray(raw) ? raw : [];
+      setResults(safeArray);
+      setTotalResultsCount(res?.data?.total_found || 0);
+      setTotalPages(res?.data?.total_pages || 0);
+      setHasNext(res?.data?.has_next || false);
+      setHasPrevious(res?.data?.has_previous || false);
+    } catch (e) {
+      const message = e?.response?.data?.detail || e?.message || 'Unknown error';
+      setError(`Failed to fetch results: ${message}`);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Vector search for mic (voice) input with flag
+  const handleMicVectorSearch = async (page = null) => {
+    // page can be a number (for pagination) or null/undefined (for new search)
+    const targetPage = (typeof page === 'number' && page > 0) ? page : 1;
+    setIsSearching(true);
+    setError("");
+    setResults([]);
+    setCurrentPage(targetPage);
+    setLastSearchType('mic');
+    try {
+      const res = await axios.post(`${BACKEND_URL}/search/vector`, {
+        query: String(micQuery || ""),
+        use_nlp: false,
+        is_voice: true,
+        page: targetPage,
+        page_size: pageSize
+      });
+      const raw = res?.data?.results;
+      const safeArray = Array.isArray(raw) ? raw : [];
+      setResults(safeArray);
+      setTotalResultsCount(res?.data?.total_found || 0);
+      setTotalPages(res?.data?.total_pages || 0);
+      setHasNext(res?.data?.has_next || false);
+      setHasPrevious(res?.data?.has_previous || false);
     } catch (e) {
       const message = e?.response?.data?.detail || e?.message || 'Unknown error';
       setError(`Failed to fetch results: ${message}`);
@@ -795,73 +878,56 @@ function App() {
           </div>
         )}
 
-        {/* Search bar - hidden in voice mode */}
-        {viewMode !== "voice" && (
+        {/* Two search cards: Text and Mic */}
         <div style={{
-          display: "flex",
-          alignItems: "center",
-          border: "1px solid #e5e7eb",
-          borderRadius: 999,
-          padding: "8px 12px",
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 12,
           margin: "16px auto",
-          maxWidth: 640,
-          gap: 8,
-          "@media (max-width: 768px)": {
-            margin: "12px auto",
-            padding: "6px 10px",
-            gap: 6
-          }
+          maxWidth: 960,
+          "@media (max-width: 768px)": { gridTemplateColumns: "1fr" }
         }}>
-          <input
-            type="text"
-            placeholder={
-              useMultilingual 
-                ? (useNLP 
-                    ? "Try: 'কাঠের দরজা মুম্বাইতে' or 'लकड़ी का दरवाजा मुंबई में' or 'மர கதவு மும்பையில்'" 
-                    : "Search in Indian languages: 'bichana', 'ghar', 'வீடு', 'ఇల్లు', 'ઘર'")
-                : (useNLP 
-                  ? "Try: 'TV Wall Unit in Bangalore between 50-100 sqft under ₹50000'" 
-                  : "Search items with semantic similarity...")
-            }
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(1); }}
-            style={{ flex: 1, border: "none", outline: "none", background: "transparent" }}
-          />
-          <button
-            onClick={handleVoiceToggle}
-            title="Auto-detect Indian language voice search"
-            style={{
-              border: "none",
-              background: isListening ? "#dc2626" : "#111827",
-              color: "#fff",
-              borderRadius: 999,
-              padding: "6px 10px",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              gap: 4
-            }}
-          >
-            {isListening ? "Stop" : "🎤"}
-            <span style={{ fontSize: 10 }}>
-              AUTO
-            </span>
-          </button>
-          <button 
-            onClick={() => handleSearch(1)} 
-            style={{ 
-              ...buttonStyle, 
-              marginLeft: 8,
-              background: useMultilingual ? "#f59e0b" : "#111827"
-            }} 
-            disabled={isSearching}
-            title={useMultilingual ? "Search with Indian language support" : "Search in English"}
-          >
-            {isSearching ? "Searching..." : (useMultilingual ? "🌍 Search" : "Search")}
-          </button>
+          {/* Text Input Card */}
+          <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", padding: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Text Search</div>
+            <textarea
+              rows={3}
+              placeholder="Type your query..."
+              value={textQuery}
+              onChange={(e) => setTextQuery(e.target.value)}
+              style={{ width: "100%", border: "1px solid #e5e7eb", borderRadius: 6, padding: 8, resize: "vertical" }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+              <button onClick={(e) => { e.preventDefault(); handleTextVectorSearch(); }} style={buttonStyle} disabled={isSearching}>
+                {isSearching ? "Searching..." : "Search"}
+              </button>
+            </div>
+          </div>
+
+          {/* Mic Input Card */}
+          <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", padding: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Voice Search</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                onClick={handleVoiceToggle}
+                title="Toggle microphone"
+                style={{ ...buttonStyle, background: isListening ? "#dc2626" : "#111827" }}
+              >
+                {isListening ? "Stop" : "🎤 Mic"}
+              </button>
+              <input
+                type="text"
+                readOnly
+                placeholder="Converted text will appear here..."
+                value={micQuery}
+                style={{ flex: 1, border: "1px solid #e5e7eb", borderRadius: 6, padding: 8, background: "#f9fafb" }}
+              />
+              <button onClick={(e) => { e.preventDefault(); handleMicVectorSearch(); }} style={buttonStyle} disabled={isSearching}>
+                {isSearching ? "Searching..." : "Mic Search"}
+              </button>
+            </div>
+          </div>
         </div>
-        )}
 
         {/* Auto Language Detection Status */}
         <div style={{
@@ -951,6 +1017,81 @@ function App() {
         )}
 
 
+        {/* Results count and pagination info */}
+        {!isSearching && !error && results.length > 0 && (
+          <div style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginTop: 12,
+            padding: "8px 16px",
+            background: "#f3f4f6",
+            borderRadius: 6,
+            fontSize: 14,
+            flexWrap: "wrap",
+            gap: 8
+          }}>
+            <span style={{ color: "#6b7280" }}>
+              Showing {((currentPage - 1) * pageSize) + 1} - {Math.min(currentPage * pageSize, totalResultsCount)} of {totalResultsCount} results
+            </span>
+            {totalPages > 1 && (
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const newPage = currentPage - 1;
+                    if (lastSearchType === 'text') {
+                      handleTextVectorSearch(newPage);
+                    } else if (lastSearchType === 'mic') {
+                      handleMicVectorSearch(newPage);
+                    }
+                  }}
+                  disabled={!hasPrevious || isSearching || !lastSearchType}
+                  style={{
+                    padding: "6px 12px",
+                    border: "1px solid #e5e7eb",
+                    borderRadius: 6,
+                    background: hasPrevious ? "#fff" : "#f3f4f6",
+                    color: hasPrevious ? "#111827" : "#9ca3af",
+                    cursor: hasPrevious ? "pointer" : "not-allowed",
+                    fontSize: 14
+                  }}
+                >
+                  Previous
+                </button>
+                <span style={{ color: "#6b7280" }}>
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const newPage = currentPage + 1;
+                    if (lastSearchType === 'text') {
+                      handleTextVectorSearch(newPage);
+                    } else if (lastSearchType === 'mic') {
+                      handleMicVectorSearch(newPage);
+                    }
+                  }}
+                  disabled={!hasNext || isSearching || !lastSearchType}
+                  style={{
+                    padding: "6px 12px",
+                    border: "1px solid #e5e7eb",
+                    borderRadius: 6,
+                    background: hasNext ? "#fff" : "#f3f4f6",
+                    color: hasNext ? "#111827" : "#9ca3af",
+                    cursor: hasNext ? "pointer" : "not-allowed",
+                    fontSize: 14
+                  }}
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Empty state */}
         {!isSearching && !error && results.length === 0 && (
           <div style={{ textAlign: "center", color: "#6b7280", marginTop: 24 }}>
@@ -981,7 +1122,10 @@ function App() {
               const amountNum = toSafeNumber(item.amount);
               const avgPerSqft = sqft && sqft > 0 && amountNum != null ? (amountNum / sqft) : null;
               const subtitleParts = [item.room_name, item.project_name, item.area].filter(Boolean);
-              const avgAmount = calculateAvgAmount(item, filteredResults.length > 0 ? filteredResults : results);
+              // Use backend-calculated average_price if available, otherwise fallback to client-side calculation
+              const avgAmount = item.average_price !== undefined && item.average_price !== null 
+                ? item.average_price 
+                : calculateAvgAmount(item, filteredResults.length > 0 ? filteredResults : results);
 
               const attrs = item.attributes_parsed && typeof item.attributes_parsed === 'object' ? item.attributes_parsed : {};
 

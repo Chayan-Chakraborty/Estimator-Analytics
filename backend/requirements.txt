@@ -25,3 +25,7 @@ keybert
 opencv-python
 librosa
 numpy
+spacy
+geonamescache
+pycountry
+langdetect
