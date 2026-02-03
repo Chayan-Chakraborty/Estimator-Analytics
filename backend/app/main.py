@@ -96,10 +96,33 @@ def extract_item_name_from_query(query: str):
 
     # 1) Primary: use extractor over the synonym index
     try:
-        from app.extractor import extract_item
+        from app.extractor import extract_item, normalize as extractor_normalize
         candidate = extract_item(original_query, index)
     except Exception:
         candidate = None
+        extractor_normalize = lambda s: (s or "").strip().lower()
+
+    # 1b) If no candidate, try a fuzzy spelling correction over the index tokens.
+    if not candidate:
+        try:
+            import difflib
+
+            norm_q = extractor_normalize(original_query)
+            q_tokens = norm_q.split()
+            if q_tokens:
+                vocab = list(index.keys())
+                corrected_tokens = []
+                for tok in q_tokens:
+                    matches = difflib.get_close_matches(tok, vocab, n=1, cutoff=0.8)
+                    corrected_tokens.append(matches[0] if matches else tok)
+                corrected_query = " ".join(corrected_tokens)
+                if corrected_query != norm_q:
+                    try:
+                        candidate = extract_item(corrected_query, index)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # Helper to check whether a given item name actually has the original
     # query as a substring in any of its native/roman forms.
@@ -792,6 +815,30 @@ class NLPSearchQuery(BaseModel):
     is_voice: Optional[bool] = False
     page: Optional[int] = 1
     page_size: Optional[int] = 20
+
+
+@app.post("/search/extract-item-name")
+def api_extract_item_name(data: NLPSearchQuery) -> Dict[str, Any]:
+    """
+    Lightweight API that exposes only the item extraction step.
+
+    Given a free-text query, it returns the canonical item_name (if any)
+    resolved via the multilingual extractor + fuzzy matching logic, without
+    running any vector search.
+    """
+    query_text = (data.query or "").strip()
+    if not query_text:
+        return {
+            "query": data.query,
+            "extracted_item_name": None,
+        }
+
+    item_name = extract_item_name_from_query(query_text)
+    return {
+        "query": data.query,
+        "normalized_query": query_text,
+        "extracted_item_name": item_name,
+    }
 
 
 # Embedding and keyword extraction models (must match Qdrant collection dim=384)
