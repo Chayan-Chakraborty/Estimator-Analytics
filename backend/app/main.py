@@ -81,15 +81,68 @@ def _get_synonym_index():
 
 
 def extract_item_name_from_query(query: str):
-    """Demo.py flow: extract_item(query, synonym_index) -> canonical item_name."""
+    """Demo.py flow: extract_item(query, synonym_index) -> canonical item_name.
+
+    If the direct extractor result clearly doesn't correspond to the original
+    query (e.g., token collisions), we fall back to scanning items.json for
+    a substring match in any language's native/roman forms.
+    """
     index = _get_synonym_index()
     if not index:
         return None
+    original_query = (query or "").strip()
+    if not original_query:
+        return None
+
+    # 1) Primary: use extractor over the synonym index
     try:
         from app.extractor import extract_item
-        return extract_item(query or "", index)
+        candidate = extract_item(original_query, index)
     except Exception:
-        return None
+        candidate = None
+
+    # Helper to check whether a given item name actually has the original
+    # query as a substring in any of its native/roman forms.
+    def _item_matches_query(item_name: str) -> bool:
+        try:
+            import json
+            if not os.path.isfile(_ITEM_JSON_PATH):
+                return False
+            with open(_ITEM_JSON_PATH, "r", encoding="utf-8") as f:
+                item_json = json.load(f)
+            entry = item_json.get(item_name, {})
+            for forms in entry.values():
+                native = str(forms.get("native", "") or "")
+                roman = str(forms.get("roman", "") or "")
+                if original_query in native or original_query in roman:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    # 2) If extractor gave us a candidate that clearly corresponds to the
+    # original query (substring in any synonym), trust it.
+    if candidate and _item_matches_query(candidate):
+        return candidate
+
+    # 3) Fallback: scan items.json directly for substring matches and pick
+    # the first canonical item whose synonyms contain the query.
+    try:
+        import json
+        if os.path.isfile(_ITEM_JSON_PATH):
+            with open(_ITEM_JSON_PATH, "r", encoding="utf-8") as f:
+                item_json = json.load(f)
+            for item_name, langs in item_json.items():
+                for forms in langs.values():
+                    native = str(forms.get("native", "") or "")
+                    roman = str(forms.get("roman", "") or "")
+                    if original_query in native or original_query in roman:
+                        return item_name
+    except Exception:
+        pass
+
+    # 4) As a last resort, return whatever the extractor produced (may be None)
+    return candidate
 
 
 app = FastAPI()

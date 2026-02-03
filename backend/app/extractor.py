@@ -31,13 +31,38 @@ def build_synonym_index(item_json: dict):
     synonym_index = {}
 
     for item, langs in item_json.items():
-        synonym_index[normalize(item)] = item
+        # Index the canonical item name itself and its tokens
+        item_norm = normalize(item)
+        if item_norm:
+            if item_norm not in synonym_index:
+                synonym_index[item_norm] = item
+            for tok in item_norm.split():
+                if tok:
+                    if tok not in synonym_index:
+                        synonym_index[tok] = item
 
         for forms in langs.values():
             for val in split_variants(forms.get("native", "")):
-                synonym_index[normalize(val)] = item
+                phrase_norm = normalize(val)
+                if phrase_norm:
+                    # Full phrase
+                    if phrase_norm not in synonym_index:
+                        synonym_index[phrase_norm] = item
+                    # Also index individual tokens so queries like "स्टोरेज"
+                    # can match "स्टोरेज कैबिनेट"
+                    for tok in phrase_norm.split():
+                        if tok:
+                            if tok not in synonym_index:
+                                synonym_index[tok] = item
             for val in split_variants(forms.get("roman", "")):
-                synonym_index[normalize(val)] = item
+                phrase_norm = normalize(val)
+                if phrase_norm:
+                    if phrase_norm not in synonym_index:
+                        synonym_index[phrase_norm] = item
+                    for tok in phrase_norm.split():
+                        if tok:
+                            if tok not in synonym_index:
+                                synonym_index[tok] = item
 
     return synonym_index
 
