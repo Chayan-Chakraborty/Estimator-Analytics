@@ -1,3 +1,6 @@
+import unicodedata
+from typing import Dict, Any, List
+from keybert import KeyBERT
 import email
 from .amount_calculator import AmountCalculatorUtils
 from fastapi import FastAPI, Query, UploadFile, File, HTTPException
@@ -28,8 +31,56 @@ from app.workers.stt import transcribe_audio
 from app.workers.translate import translate_to_english, translate_with_confidence
 from app.translate_to_english import detect_and_translate
 
-zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+zero_shot = pipeline("zero-shot-classification",
+                     model="facebook/bart-large-mnli")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Add workspace root so we can import multilingual_item_extractor
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_APP_DIR)))
+if _WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, _WORKSPACE_ROOT)
+
+# Multilingual item extractor: synonym index for query -> item_name (lazy-loaded)
+_SYNONYM_INDEX = None
+_ITEM_JSON_PATH = os.environ.get(
+    "ITEM_SYNONYM_JSON_PATH",
+    os.path.join(_WORKSPACE_ROOT, "multilingual_item_extractor", "item1.json"),
+)
+
+
+def _get_synonym_index():
+    """Load item synonym JSON and build index once (from multilingual_item_extractor)."""
+    global _SYNONYM_INDEX
+    if _SYNONYM_INDEX is not None:
+        return _SYNONYM_INDEX
+    try:
+        import json
+        from multilingual_item_extractor.extractor import build_synonym_index
+        if os.path.isfile(_ITEM_JSON_PATH):
+            with open(_ITEM_JSON_PATH, "r", encoding="utf-8") as f:
+                item_json = json.load(f)
+            _SYNONYM_INDEX = build_synonym_index(item_json)
+        else:
+            _SYNONYM_INDEX = {}
+    except Exception as e:
+        print("⚠️ Could not load multilingual item extractor synonym index:", e)
+        _SYNONYM_INDEX = {}
+    return _SYNONYM_INDEX
+
+
+def extract_item_name_from_query(query: str):
+    """Use multilingual_item_extractor to get canonical item_name for a query."""
+    index = _get_synonym_index()
+    if not index:
+        return None
+    try:
+        from multilingual_item_extractor.extractor import extract_item
+        return extract_item(query or "", index)
+    except Exception:
+        return None
+
+
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
 app = FastAPI()
@@ -41,6 +92,58 @@ def normalize_text(text):
     if not text:
         return ""
     return re.sub(r'[^\w\s]', '', str(text).lower().strip())
+
+
+def calculate_area_wise_averages(items: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Calculate average prices grouped by (area, item_name) combination.
+    Returns a dict with key: f"{area}|{item_name}" and value: average price.
+    Only includes groups with at least 2 items and valid amounts.
+    """
+    if not items:
+        return {}
+
+    # Group items by (area, item_name) - case-insensitive
+    groups = defaultdict(list)
+    for item in items:
+        area = (item.get("area") or "").strip().lower()
+        item_name = (item.get("item_name") or "").strip().lower()
+        if area and item_name:
+            key = f"{area}|{item_name}"
+            groups[key].append(item)
+
+    # Calculate averages for groups with at least 2 items
+    averages = {}
+    for key, group_items in groups.items():
+        if len(group_items) < 2:
+            continue
+
+        # Extract valid amounts
+        amounts = []
+        for item in group_items:
+            amount = item.get("amount")
+            if amount is None:
+                continue
+            # Handle string amounts
+            if isinstance(amount, str):
+                try:
+                    amount_val = float(amount.strip())
+                except (ValueError, AttributeError):
+                    continue
+            elif isinstance(amount, (int, float)):
+                amount_val = float(amount)
+            else:
+                continue
+
+            if amount_val > 0:
+                amounts.append(amount_val)
+
+        # Only calculate if we have at least one valid amount
+        if len(amounts) > 0:
+            avg = sum(amounts) / len(amounts)
+            averages[key] = avg
+
+    return averages
 
 
 def find_similar_items(target_text, items, field, threshold=0.6):
@@ -179,6 +282,7 @@ class InsertItemRequest(BaseModel):
     project_name: str
     attributes: Optional[str] = None
     item_identifier: Optional[str] = None
+    item_type_identifier: Optional[str] = None
     user_id: Optional[int] = None
     image: Optional[str] = None
 
@@ -224,6 +328,7 @@ class MultilingualSearchResponse(BaseModel):
 
 # ---------------- Helper ----------------
 
+
 def translate_query(query: str,
                     source_lang: Optional[str] = None,
                     target_lang: str = "en") -> Dict[str, Any]:
@@ -249,7 +354,8 @@ def translate_query(query: str,
         print(f"Debug: Detected language: {detected}")
         print(f"Debug: Target language: {target_lang}")
         print(f"Debug: Confidence: 0.9")
-        print(f"Debug: Translation needed: {detected.lower() != target_lang.lower()}")
+        print(
+            f"Debug: Translation needed: {detected.lower() != target_lang.lower()}")
 
         return {
             "translated_query": translated_text,
@@ -278,7 +384,7 @@ def calculate_amount_from_attributes(item):
             attrs = json.loads(attrs)
         if not attrs or not isinstance(attrs, dict):
             return 0.0
-        item_id = item.get('item_identifier') or ''
+        item_id = item.get('item_type_identifier') or ''
         if 'WD' in item_id:
             return AmountCalculatorUtils.calc_woodwork_amount(type('Item', (), {'attributes': item['attributes']})())
         elif 'FC' in item_id:
@@ -354,7 +460,8 @@ async def speech_query(audio: UploadFile = File(...)):
         print(f"Debug: English text: {english_text}")
         return {"english_query": english_text}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Speech processing failed: {e}")
+        raise HTTPException(
+            status_code=400, detail=f"Speech processing failed: {e}")
 
 
 @app.post("/speech/text-to-english")
@@ -367,11 +474,12 @@ async def text_to_english(payload: Dict[str, str]):
     src = payload.get("source_language") if payload else None
     if not txt:
         return {"english_query": ""}
-    
+
     try:
         # Fast path: use simple Google translation
         if src:
-            print(f"GoogleTranslator conversion Text to english: Text: {txt}, Source language: {src}")
+            print(
+                f"GoogleTranslator conversion Text to english: Text: {txt}, Source language: {src}")
             # If source language is specified, use it directly
             # tr = GoogleTranslator(source=src, target="en")
             # english_text = tr.translate(txt)
@@ -379,9 +487,10 @@ async def text_to_english(payload: Dict[str, str]):
             # english_text = translate_to_english(txt, src)
             english_text = detect_and_translate(txt, src)
         else:
-            print(f"Intelligent translate Text to english: Text: {txt}, Source language: {src}, English text: {english_text}, Detected language: {detected_src}")
+            print(
+                f"Intelligent translate Text to english: Text: {txt}, Source language: {src}, English text: {english_text}, Detected language: {detected_src}")
             english_text, detected_src = intelligent_translate(txt, src)
-        
+
         return {"english_query": english_text, "detected_language": detected_src}
     except Exception as e:
         # Fallback: return original text if translation fails
@@ -394,7 +503,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
     Handles queries like "I want a bed", "I need a console table", "items for 1 BHK flat"
     """
     query_lower = query.lower().strip()
-    
+
     # Common furniture and home items mapping
     furniture_keywords = {
         'bed': ['bed', 'beds', 'mattress', 'sleeping'],
@@ -410,7 +519,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
         'flooring': ['floor', 'flooring', 'tiles', 'marble'],
         'ceiling': ['ceiling', 'roof', 'false ceiling']
     }
-    
+
     # Property type keywords
     property_keywords = {
         '1bhk': ['1 bhk', '1bhk', 'one bhk', '1 bedroom'],
@@ -420,7 +529,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
         'flat': ['flat', 'apartment', 'unit'],
         'house': ['house', 'villa', 'home']
     }
-    
+
     # Extract intent
     intent = "search"  # default
     if any(word in query_lower for word in ['want', 'need', 'looking for', 'require', 'search for']):
@@ -429,7 +538,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
         intent = "list"
     elif any(word in query_lower for word in ['buy', 'purchase', 'order']):
         intent = "purchase"
-    
+
     # Extract furniture/home items
     found_items = []
     for category, keywords in furniture_keywords.items():
@@ -437,7 +546,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
             if keyword in query_lower:
                 found_items.append(category)
                 break
-    
+
     # Extract property type
     found_property = None
     for prop_type, keywords in property_keywords.items():
@@ -445,7 +554,7 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
             if keyword in query_lower:
                 found_property = prop_type
                 break
-    
+
     # Extract room types
     room_keywords = {
         'bedroom': ['bedroom', 'master bedroom', 'guest room'],
@@ -455,14 +564,14 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
         'dining': ['dining room', 'dining area'],
         'study': ['study room', 'office', 'work area']
     }
-    
+
     found_rooms = []
     for room_type, keywords in room_keywords.items():
         for keyword in keywords:
             if keyword in query_lower:
                 found_rooms.append(room_type)
                 break
-    
+
     return {
         'intent': intent,
         'furniture_items': found_items,
@@ -471,12 +580,13 @@ def extract_intent_and_keywords(query: str) -> Dict[str, Any]:
         'original_query': query
     }
 
+
 @app.post("/search/nlp")
 def search_with_nlp(data: NLPSearchQuery):
     try:
         # Enhanced NLP processing
         nlp_analysis = extract_intent_and_keywords(data.query)
-        
+
         # Get vector search results
         vector = MODEL.encode(data.query).tolist()
         result = client.search(
@@ -484,7 +594,7 @@ def search_with_nlp(data: NLPSearchQuery):
             query_vector=vector,
             limit=10000
         )
-        
+
         all_items = []
         for r in result:
             try:
@@ -498,32 +608,32 @@ def search_with_nlp(data: NLPSearchQuery):
             except Exception as e:
                 print(f"Error processing item: {e}")
                 continue
-        
+
         if not data.use_nlp:
             return {"results": all_items, "extracted_filters": {}, "nlp_analysis": nlp_analysis}
-        
+
         # Enhanced filtering based on NLP analysis
         filtered_items = all_items
         extracted_filters = {}
-        
+
         # Filter by furniture items if found
         if nlp_analysis['furniture_items']:
             furniture_filtered = []
             for item in all_items:
                 item_name_lower = item.get('item_name', '').lower()
                 item_keywords = [k.lower() for k in item.get('keywords', [])]
-                
+
                 # Check if any furniture item matches
                 for furniture in nlp_analysis['furniture_items']:
-                    if (furniture in item_name_lower or 
-                        any(furniture in kw for kw in item_keywords)):
+                    if (furniture in item_name_lower or
+                            any(furniture in kw for kw in item_keywords)):
                         furniture_filtered.append(item)
                         break
-            
+
             if furniture_filtered:
                 filtered_items = furniture_filtered
                 extracted_filters['furniture_items'] = nlp_analysis['furniture_items']
-        
+
         # Filter by room type if found
         if nlp_analysis['room_types']:
             room_filtered = []
@@ -533,23 +643,25 @@ def search_with_nlp(data: NLPSearchQuery):
                     if room_type in room_name:
                         room_filtered.append(item)
                         break
-            
+
             if room_filtered:
                 filtered_items = room_filtered
                 extracted_filters['room_types'] = nlp_analysis['room_types']
-        
+
         # Apply traditional filters
         city = extract_city_from_text(data.query)
         if city:
             extracted_filters['city'] = city
-            filtered_items = [item for item in filtered_items if city.lower() in item.get('area', '').lower()]
-        
-        measurement_min, measurement_max = extract_measurement_from_text(data.query)
+            filtered_items = [
+                item for item in filtered_items if city.lower() in item.get('area', '').lower()]
+
+        measurement_min, measurement_max = extract_measurement_from_text(
+            data.query)
         if measurement_min is not None:
             extracted_filters['measurement_min'] = measurement_min
         if measurement_max is not None:
             extracted_filters['measurement_max'] = measurement_max
-        
+
         amount_min, amount_max = extract_amount_from_text(data.query)
         if amount_min is not None:
             extracted_filters['amount_min'] = amount_min
@@ -616,12 +728,12 @@ def search_with_nlp(data: NLPSearchQuery):
 #         # Extract keywords from query first
 #         query_lower = data.query.lower()
 #         extracted_keywords = []
-        
+
 #         # Smart keyword extraction - filter out stop words
 #         import re
 #         from difflib import SequenceMatcher
 #         from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as SK_STOP
-        
+
 #         # Common stop words to ignore
 #         # Start with sklearn's general English stopwords, then add domain-generic words that
 #         # we don't want to influence matching regardless of language
@@ -633,11 +745,11 @@ def search_with_nlp(data: NLPSearchQuery):
 #         words = re.findall(r'\b\w+\b', query_lower)
 #         common_short_fillers = {w for w in words if len(w) <= 3}
 #         stop_words.update(common_short_fillers)
-        
+
 #         # Split by common words and punctuation
 #         # Filter out stop words and short words
 #         extracted_keywords = [
-#             word for word in words 
+#             word for word in words
 #             if len(word) > 2 and word not in stop_words
 #         ]
 
@@ -648,12 +760,12 @@ def search_with_nlp(data: NLPSearchQuery):
 #             'consol': 'console'
 #         }
 #         extracted_keywords = [corrections.get(w, w) for w in extracted_keywords]
-        
+
 #         # Debug: print extracted keywords
 #         print(f"Debug: Query: {data.query}")
 #         print(f"Debug: All words: {words}")
 #         print(f"Debug: Extracted keywords: {extracted_keywords}")
-        
+
 #         # Get all items from the collection for keyword filtering
 #         all_items = []
 #         scroll_result = client.scroll(
@@ -661,7 +773,7 @@ def search_with_nlp(data: NLPSearchQuery):
 #             limit=10000,
 #             with_payload=True
 #         )
-        
+
 #         for point in scroll_result[0]:
 #             try:
 #                 item = point.payload.copy()
@@ -686,7 +798,7 @@ def search_with_nlp(data: NLPSearchQuery):
 #             except Exception as e:
 #                 print(f"Error processing item: {e}")
 #                 continue
-        
+
 #         # Helper: normalize ascii-only string
 #         def norm(s: str) -> str:
 #             s = (s or '').lower()
@@ -738,21 +850,21 @@ def search_with_nlp(data: NLPSearchQuery):
 #         for item in all_items:
 #             # Check if item contains any of the keywords
 #             item_text = ""
-            
+
 #             # Combine all searchable text from the item
 #             item_text += f" {item.get('item_name', '')}"
 #             item_text += f" {item.get('room_name', '')}"
 #             item_text += f" {item.get('area', '')}"
 #             item_text += f" {item.get('project_name', '')}"
-            
+
 #             # Add attributes
 #             attrs_parsed = item.get('attributes_parsed', {})
 #             if isinstance(attrs_parsed, dict):
 #                 for key, value in attrs_parsed.items():
 #                     item_text += f" {value}"
-            
+
 #             item_text = item_text.lower()
-            
+
 #             # If material is requested, enforce exact material family match
 #             if requested_material:
 #                 mat_val = ''
@@ -770,16 +882,16 @@ def search_with_nlp(data: NLPSearchQuery):
 #             for keyword in effective_keywords:
 #                 if fuzzy_contains(item_text, keyword):
 #                     keyword_matches += 1
-            
+
 #             # Only include items that have ALL keywords matching
 #             if keyword_matches == len(effective_keywords) and len(effective_keywords) > 0:
 #                 item['keyword_matches'] = keyword_matches
 #                 filtered_items.append(item)
-        
+
 #         # Now rank by vector similarity
 #         if filtered_items:
 #             vector = MODEL.encode(data.query).tolist()
-            
+
 #             # Calculate similarity scores for filtered items
 #             scored_items = []
 #             for item in filtered_items:
@@ -790,26 +902,26 @@ def search_with_nlp(data: NLPSearchQuery):
 #                     if isinstance(attrs_parsed, dict):
 #                         for key, value in attrs_parsed.items():
 #                             item_text += f" {value}"
-                    
+
 #                     # Encode the item text
 #                     item_vector = MODEL.encode(item_text).tolist()
-                    
+
 #                     # Calculate cosine similarity
 #                     import numpy as np
 #                     similarity = np.dot(vector, item_vector) / (np.linalg.norm(vector) * np.linalg.norm(item_vector))
-                    
+
 #                     item['similarity_score'] = round(float(similarity), 4)
 #                     scored_items.append(item)
 #                 except Exception as e:
 #                     print(f"Error calculating similarity: {e}")
 #                     continue
-            
+
 #             # Sort by similarity score (highest first)
 #             scored_items.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
 #             items = scored_items
 #         else:
 #             items = []
-        
+
 #         return {
 #             "results": items,
 #             "query": data.query,
@@ -821,11 +933,14 @@ def search_with_nlp(data: NLPSearchQuery):
 #         print(f"Error in vector search: {e}")
 #         return {"results": [], "error": str(e), "total_found": 0}
 
-from keybert import KeyBERT
 
 class NLPSearchQuery(BaseModel):
     query: str
     top_k: Optional[int] = 10000
+    use_nlp: Optional[bool] = False
+    is_voice: Optional[bool] = False
+    page: Optional[int] = 1
+    page_size: Optional[int] = 20
 
 
 # Embedding and keyword extraction models (must match Qdrant collection dim=384)
@@ -870,86 +985,283 @@ class VectorPlan(BaseModel):
     embedding_text: str
     keywords: List[str] = []
     top_k: Optional[int] = 10000
+    item_name: Optional[str] = None  # from multilingual_item_extractor; filters Qdrant by item_name
 
+
+# ----- Script detection -----
+
+
+def detect_script(text: str) -> str:
+    """Detect script/language based on Unicode range"""
+    if not text:
+        return "unknown"
+
+    for ch in text:
+        code_point = ord(ch)
+        if 0x0900 <= code_point <= 0x097F:
+            return "devanagari"    # Hindi, Marathi
+        elif 0x0980 <= code_point <= 0x09FF:
+            return "bengali"
+        elif 0x0B80 <= code_point <= 0x0BFF:
+            return "tamil"
+        elif 0x0C00 <= code_point <= 0x0C7F:
+            return "telugu"
+        elif 0x0C80 <= code_point <= 0x0CFF:
+            return "kannada"
+        elif 0x0D00 <= code_point <= 0x0D7F:
+            return "malayalam"
+        elif 0x0000 <= code_point <= 0x007F:
+            return "latin"
+    return "unknown"
+
+# ----- Normalization according to script -----
+
+
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+    script = detect_script(text)
+    # Remove zero-width characters
+    text = re.sub(r"[\u200c\u200d]", "", text)
+
+    if script in ("devanagari", "bengali", "tamil", "telugu", "kannada", "malayalam"):
+        text = unicodedata.normalize("NFC", text)
+    else:
+        text = unicodedata.normalize("NFKC", text)
+        text = text.lower()
+
+    return text
+
+
+# ----- Main vector plan execution -----
+
+# Detect script/language based on Unicode range
+
+def detect_script(text: str) -> str:
+    if not text:
+        return "unknown"
+    for ch in text:
+        code_point = ord(ch)
+        if 0x0900 <= code_point <= 0x097F:
+            return "devanagari"    # Hindi, Marathi
+        elif 0x0980 <= code_point <= 0x09FF:
+            return "bengali"
+        elif 0x0B80 <= code_point <= 0x0BFF:
+            return "tamil"
+        elif 0x0C00 <= code_point <= 0x0C7F:
+            return "telugu"
+        elif 0x0C80 <= code_point <= 0x0CFF:
+            return "kannada"
+        elif 0x0D00 <= code_point <= 0x0D7F:
+            return "malayalam"
+        elif 0x0000 <= code_point <= 0x007F:
+            return "latin"
+    return "unknown"
+
+# Normalize text according to script
+
+
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.strip()
+    script = detect_script(text)
+    # Remove zero-width characters
+    text = re.sub(r"[\u200c\u200d]", "", text)
+    if script in ("devanagari", "bengali", "tamil", "telugu", "kannada", "malayalam"):
+        text = unicodedata.normalize("NFC", text)
+    else:
+        text = unicodedata.normalize("NFKC", text)
+        text = text.lower()
+    return text
+
+
+# Detect script/language based on Unicode range
+
+
+def detect_script(text: str) -> str:
+    if not text:
+        return "unknown"
+    for ch in text:
+        code_point = ord(ch)
+        if 0x0900 <= code_point <= 0x097F:
+            return "devanagari"    # Hindi, Marathi
+        elif 0x0980 <= code_point <= 0x09FF:
+            return "bengali"
+        elif 0x0B80 <= code_point <= 0x0BFF:
+            return "tamil"
+        elif 0x0C00 <= code_point <= 0x0C7F:
+            return "telugu"
+        elif 0x0C80 <= code_point <= 0x0CFF:
+            return "kannada"
+        elif 0x0D00 <= code_point <= 0x0D7F:
+            return "malayalam"
+        elif 0x0000 <= code_point <= 0x007F:
+            return "latin"
+    return "unknown"
+
+# Normalize text according to script
+
+
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+    script = detect_script(text)
+    # Remove zero-width characters
+    text = re.sub(r"[\u200c\u200d]", "", text)
+
+    if script in ("devanagari", "bengali", "tamil", "telugu", "kannada", "malayalam"):
+        text = unicodedata.normalize("NFC", text)
+    else:
+        text = unicodedata.normalize("NFKC", text)
+        text = text.lower()
+
+    return text
+
+
+from typing import Dict, Any
+
+from typing import Dict, Any, List, Set
 
 def execute_vector_plan(plan: "VectorPlan") -> Dict[str, Any]:
+    import unicodedata, re, json
+
     try:
-        embed_text = (plan.embedding_text or "").strip()
-        if not embed_text:
-            return {"results": [], "total_found": 0, "error": "empty embedding_text"}
+        # --- Helper function to normalize text ---
+        def normalize_text(text: str) -> str:
+            if not isinstance(text, str):
+                return ""
+            text = text.strip()
+            text = re.sub(r"[\u200c\u200d]", "", text)
+            return unicodedata.normalize("NFKC", text).lower()
 
-        query_vector = MODEL.encode(embed_text).tolist()
+        # --- Helper function to check if item matches plan keywords ---
+        def matches_plan_keywords(item: dict, plan_keywords: Set[str]) -> bool:
+            # Normalize keywords
+            raw_keywords = item.get("keywords", [])
+            if isinstance(raw_keywords, str):
+                try:
+                    raw_keywords = json.loads(raw_keywords)
+                    if not isinstance(raw_keywords, list):
+                        raw_keywords = [str(raw_keywords)]
+                except Exception:
+                    raw_keywords = [k.strip() for k in raw_keywords.split(",") if k.strip()]
+            keywords_list = [normalize_text(k) for k in (raw_keywords or []) if k]
 
-        q_filter = None
+            # Normalize area
+            area_norm = normalize_text(item.get("area", ""))
+
+            # Flatten and normalize attributes
+            attrs_dict = item.get("attributes_parsed") or item.get("parsed_attrs") or {}
+            attrs_norm = []
+            if isinstance(attrs_dict, dict):
+                for v in attrs_dict.values():
+                    if v is None:
+                        continue
+                    if isinstance(v, list):
+                        attrs_norm.extend([normalize_text(str(sv)) for sv in v])
+                    else:
+                        attrs_norm.append(normalize_text(str(v)))
+
+            # Combine searchable fields
+            searchable_fields = set(keywords_list + attrs_norm + [area_norm])
+            searchable_fields.discard("")  # remove empty strings
+
+            # Check if any plan keyword exists in searchable fields
+            return bool(searchable_fields.intersection(plan_keywords))
+
+        # --- Prepare plan keywords ---
+        plan_keywords = set(normalize_text(kw) for kw in (plan.keywords or []) if kw.strip())
+        has_item_name = bool(getattr(plan, "item_name", None) and str(plan.item_name).strip())
+        if not plan_keywords and not has_item_name:
+            return {"results": [], "total_found": 0, "error": "No keywords or item_name provided"}
+
+        # --- Optional: query vector for embedding search ---
+        query_vector = None
+        if getattr(plan, "embedding_text", None):
+            query_vector = MODEL.encode(plan.embedding_text).tolist()
+
+        # --- Execute vector DB search ---
+        must_conditions = []
         if plan.keywords:
             try:
-                q_filter = Filter(must=[FieldCondition(key="keywords", match=MatchAny(any=plan.keywords))])
+                from qdrant_client.http.models import Filter, FieldCondition, MatchAny
+                must_conditions.append(
+                    FieldCondition(key="keywords", match=MatchAny(any=list(plan_keywords)))
+                )
+            except Exception:
+                pass
+        # Filter by item_name when provided (from multilingual_item_extractor)
+        if getattr(plan, "item_name", None) and str(plan.item_name).strip():
+            try:
+                from qdrant_client.http.models import MatchValue
+                must_conditions.append(
+                    FieldCondition(key="item_name", match=MatchValue(value=plan.item_name.strip()))
+                )
+            except Exception:
+                pass
+        q_filter = None
+        if must_conditions:
+            try:
+                from qdrant_client.http.models import Filter
+                q_filter = Filter(must=must_conditions)
             except Exception:
                 q_filter = None
 
-        raw = client.search(
+        raw_items = client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
-            limit=getattr(plan, 'top_k', 10000) or 10000,
-            query_filter=q_filter
+            limit=getattr(plan, "top_k", 10000) or 10000,
+            query_filter=q_filter,
         )
 
-        items: List[Dict[str, Any]] = []
-        strict_keywords = [k.strip().lower() for k in (plan.keywords or []) if k and k.strip()]
-        for r in raw:
+        # --- Filter results by keywords, area, attributes (skip when only item_name filter) ---
+        results = []
+        for r in raw_items:
             try:
-                item = r.payload.copy()
-                item['id'] = r.id
-                item['similarity_score'] = float(getattr(r, 'score', 0.0))
-                if not item.get('amount') or item.get('amount') == 0:
-                    calc = calculate_amount_from_attributes(item)
-                    if calc > 0:
-                        item['amount'] = calc
-                # Precise keyword matching: ALL keywords must have some match
-                if strict_keywords:
-                    item_kws = set(str(k).lower() for k in (item.get('keywords') or []))
-                    item_text = f"{item.get('item_name', '')} {item.get('room_name', '')} {item.get('area', '')}"
-                    attrs_parsed = item.get('attributes_parsed', {})
-                    if isinstance(attrs_parsed, dict):
-                        for key, value in attrs_parsed.items():
-                            item_text += f" {value}"
-                    item_text = item_text.lower()
-                    
-                    # Check if ALL keywords have some match in item
-                    all_keywords_match = True
-                    for extracted_kw in strict_keywords:
-                        keyword_found = False
-                        # Check in keywords list
-                        for item_kw in item_kws:
-                            if (extracted_kw == item_kw or 
-                                extracted_kw in item_kw or 
-                                item_kw in extracted_kw):
-                                keyword_found = True
-                                break
-                        # Check in full text if not found in keywords
-                        if not keyword_found and extracted_kw in item_text:
-                            keyword_found = True
-                        
-                        if not keyword_found:
-                            all_keywords_match = False
-                            break
-                    
-                    if not all_keywords_match:
-                        continue
-                items.append(item)
+                item = getattr(r, "payload", r) if hasattr(r, "payload") else r.copy()
+                item["id"] = getattr(r, "id", None)
+                similarity = getattr(r, "score", None)
+                if similarity is not None:
+                    item["similarity_score"] = similarity
+                if plan_keywords:
+                    if matches_plan_keywords(item, plan_keywords):
+                        item["score"] = 1.0  # keyword match
+                        results.append(item)
+                else:
+                    # Only item_name filter (from multilingual extractor); accept all from Qdrant
+                    item["score"] = getattr(r, "score", 1.0)
+                    results.append(item)
             except Exception as ex:
-                print("Vector result formatting error:", ex)
+                print("Item processing error:", ex)
                 continue
-        
-        return {"results": items, "total_found": len(items)}
+
+        total_found = len(results)
+        return {
+            "keywords": list(plan_keywords),
+            "results": results,
+            "total_found": total_found,
+            "page": 1,
+            "page_size": 20,
+            "total_pages": (total_found + 19) // 20,
+            "has_next": total_found > 20,
+            "has_previous": False,
+            "search_type": "keyword_match_fields_only",
+        }
+
     except Exception as e:
         return {"results": [], "total_found": 0, "error": str(e)}
+
 
 @app.post("/search/voice")
 async def search_voice(file: UploadFile = File(...)):
     """
     Voice search endpoint: audio → text → translation → vector search.
-    
+
     Pipeline:
     1. Transcribe audio to text using faster-whisper
     2. Detect language and translate to English if needed
@@ -959,17 +1271,19 @@ async def search_voice(file: UploadFile = File(...)):
     try:
         # Step 1: Transcribe audio to text
         transcribed_text = transcribe_audio(file)
-        
+
         if not transcribed_text or not transcribed_text.strip():
-            raise HTTPException(status_code=400, detail="No speech detected in audio")
-        
+            raise HTTPException(
+                status_code=400, detail="No speech detected in audio")
+
         # Step 2: Translate to English if needed
-        translated_text, detected_language, confidence = translate_with_confidence(transcribed_text)
-        
+        translated_text, detected_language, confidence = translate_with_confidence(
+            transcribed_text)
+
         # Step 3: Perform vector search with translated text
         search_data = NLPSearchQuery(query=translated_text, use_nlp=True)
         search_results = search_with_vector_similarity(search_data)
-        
+
         # Step 4: Format results
         formatted_results = []
         for item in search_results.get("results", []):
@@ -982,7 +1296,7 @@ async def search_voice(file: UploadFile = File(...)):
                 "amount": str(item.get("amount", "0.00"))
             }
             formatted_results.append(formatted_item)
-        
+
         return {
             "query_transcribed": transcribed_text,
             "query_translated": translated_text,
@@ -991,68 +1305,128 @@ async def search_voice(file: UploadFile = File(...)):
             "results": formatted_results,
             "total_found": len(formatted_results)
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Voice search failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Voice search failed: {str(e)}")
 
 
 @app.post("/search/vector")
 def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
     """
-    Optimized semantic search using Qdrant vectors with optional keyword pre-filter.
-    - Extract top keywords from the query (KeyBERT over the same embedding model)
-    - Build a Qdrant payload filter on `keywords` if any exist
-    - Perform vector search using 384‑dim embeddings
-    - Post-process payloads to ensure computed fields (e.g., amount) are present
+    Optimized multilingual semantic search using Qdrant vectors with optional keyword pre-filter.
+    - Extract top keywords from the query (KeyBERT for English, fallback for others)
+    - Detects and handles Bengali, Hindi, Tamil, Telugu, etc.
+    - Builds Qdrant payload filter on `keywords` if any exist
+    - Performs vector search using 384-dim embeddings
+    - Post-processes payloads to ensure computed fields (e.g., amount, average_price) are present
     """
+    import regex as re  # Unicode-aware regex
+    import unicodedata
+
+    def normalize_text(t: str) -> str:
+        """Normalize multilingual text to a consistent lowercase form."""
+        if not isinstance(t, str):
+            return ""
+        return unicodedata.normalize("NFKC", t).strip().lower()
+
+    def contains_non_latin(text: str) -> bool:
+        """Detect if the text contains any non-Latin (e.g., Bengali, Hindi, Tamil) characters."""
+        return bool(re.search(r"[^\p{Latin}]", text))
+
     try:
         query_text = (data.query or "").strip()
         if not query_text:
             return {"results": [], "query": data.query, "total_found": 0}
 
-        # 1) Build a local plan (can be replaced by external AI planner)
+        normalized_query = normalize_text(query_text)
+
+        # -------------------------------------------------------------
+        # 1️⃣ Keyword Extraction (Unicode + Multilingual Safe)
+        # -------------------------------------------------------------
         try:
-            kw_pairs = KW_MODEL.extract_keywords(query_text, keyphrase_ngram_range=(1, 2), stop_words='english')
-            attr_blacklist = {
-                "rate", "rate per sqft", "quantity", "price/unit", "price",
-                "measurement", "material", "finish", "description", "brand"
-            }
-            # Build ordered keyword list: include cleansed bigrams (if both tokens allowed)
-            # and include individual allowed tokens. Preserve order of appearance.
-            ordered: list[str] = []
-            seen: set[str] = set()
+            if contains_non_latin(normalized_query):
+                # Non-Latin text (Bengali, Hindi, etc.) — split by space only
+                keywords = [
+                    normalize_text(word)
+                    for word in normalized_query.split()
+                    if word.strip()
+                ]
+                print("🔠 Non-Latin detected, keywords:", keywords)
+            else:
+                # English or Latin script — use KeyBERT
+                kw_pairs = KW_MODEL.extract_keywords(
+                    normalized_query,
+                    keyphrase_ngram_range=(1, 2),
+                    stop_words='english'
+                )
 
-            def add_term(term: str):
-                t = term.strip().lower()
-                if not t or t in seen:
-                    return
-                seen.add(t)
-                ordered.append(t)
+                if not kw_pairs:
+                    kw_pairs = [(normalized_query, 1.0)]
 
-            for kw, _score in kw_pairs:
-                if not isinstance(kw, str) or not kw.strip():
-                    continue
-                toks = re.findall(r"\b\w+\b", kw.lower())
-                toks = [t for t in toks if t not in attr_blacklist]
-                if len(toks) >= 2:
-                    bigram = " ".join(toks[:2])
-                    add_term(bigram)
-                for t in toks:
-                    add_term(t)
+                attr_blacklist = {
+                    "rate", "rate per sqft", "quantity", "price/unit", "price",
+                    "measurement", "material", "finish", "description", "brand"
+                }
 
-            keywords = ordered
-        except Exception:
-            keywords = []
+                ordered: list[str] = []
+                seen: set[str] = set()
 
-        plan = VectorPlan(embedding_text=query_text, keywords=keywords, top_k=getattr(data, 'top_k', 10000))
+                def add_term(term: str):
+                    t = term.strip().lower()
+                    if not t or t in seen:
+                        return
+                    seen.add(t)
+                    ordered.append(t)
 
-        # 2) Execute plan via shared executor
+                for kw, _score in kw_pairs:
+                    if not isinstance(kw, str) or not kw.strip():
+                        continue
+
+                    # Unicode-aware word extraction
+                    toks = re.findall(r"\p{L}+", kw.lower())
+                    toks = [t for t in toks if t not in attr_blacklist]
+
+                    if len(toks) >= 2:
+                        bigram = " ".join(toks[:2])
+                        add_term(bigram)
+
+                    for t in toks:
+                        add_term(t)
+
+                if not ordered:
+                    ordered = [normalized_query]
+
+                keywords = ordered
+                print("🔤 Latin detected, ordered keywords:", keywords)
+
+        except Exception as ex:
+            print("⚠️ Keyword extraction error:", ex)
+            keywords = [normalized_query]
+
+        # -------------------------------------------------------------
+        # 1b. Extract item_name from query (multilingual_item_extractor)
+        # -------------------------------------------------------------
+        extracted_item_name = extract_item_name_from_query(query_text)
+
+        # -------------------------------------------------------------
+        # 2️⃣ Build and Execute Vector Search Plan
+        # -------------------------------------------------------------
+        plan = VectorPlan(
+            embedding_text=query_text,
+            keywords=keywords,
+            top_k=getattr(data, 'top_k', 10000),
+            item_name=extracted_item_name,
+        )
+
         exec_res = execute_vector_plan(plan)
 
-        # Format results to match the required format
-        formatted_results = []
+        # -------------------------------------------------------------
+        # 3️⃣ Format Results and Compute Averages
+        # -------------------------------------------------------------
+        all_formatted_results = []
         for item in exec_res.get("results", []):
             formatted_item = {
                 "id": item.get("id"),
@@ -1060,24 +1434,66 @@ def search_with_vector_similarity(data: NLPSearchQuery) -> Dict[str, Any]:
                 "project_name": item.get("project_name"),
                 "room_name": item.get("room_name"),
                 "item_identifier": item.get("item_identifier"),
+                "item_type_identifier": item.get("item_type_identifier"),
                 "description": item.get("description"),
-                "keywords": item.get("keywords"),
                 "score": round(item.get("similarity_score", 0.0), 3),
                 "item_name": item.get("item_name"),
                 "attributes_parsed": item.get("attributes_parsed", {}),
                 "image": item.get("image"),
                 "amount": str(item.get("amount", "0.00"))
             }
-            formatted_results.append(formatted_item)
-        
+            all_formatted_results.append(formatted_item)
+
+        # -------------------------------------------------------------
+        # 4️⃣ Compute Area-wise Average Price
+        # -------------------------------------------------------------
+        averages = calculate_area_wise_averages(all_formatted_results)
+
+        for item in all_formatted_results:
+            area = (item.get("area") or "").strip().lower()
+            item_name = (item.get("item_name") or "").strip().lower()
+            if area and item_name:
+                key = f"{area}|{item_name}"
+                if key in averages:
+                    item["average_price"] = round(averages[key], 2)
+                else:
+                    item["average_price"] = None
+            else:
+                item["average_price"] = None
+
+        # -------------------------------------------------------------
+        # 5️⃣ Pagination
+        # -------------------------------------------------------------
+        page = max(1, getattr(data, 'page', 1) or 1)
+        # Cap at 100 per page
+        page_size = max(1, min(100, getattr(data, 'page_size', 20) or 20))
+        total_count = len(all_formatted_results)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_results = all_formatted_results[start_idx:end_idx]
+        total_pages = (total_count + page_size -
+                       1) // page_size if total_count > 0 else 0
+
+        # -------------------------------------------------------------
+        # 6️⃣ Final Response
+        # -------------------------------------------------------------
         return {
             "query": data.query,
-            "results": formatted_results,
-            "total_found": len(formatted_results),
-            "search_type": "vector_similarity_with_keywords",
-            "extracted_keywords": keywords
+            "normalized_query": normalized_query,
+            "keywords": keywords,
+            "extracted_item_name": extracted_item_name,
+            "results": paginated_results,
+            "total_found": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1,
+            "search_type": "vector_similarity_with_keywords"
         }
+
     except Exception as e:
+        print("❌ Error in search_with_vector_similarity:", e)
         return {"results": [], "error": str(e), "total_found": 0}
 
 
@@ -1088,7 +1504,8 @@ def get_vector_search_prompt(data: NLPSearchQuery) -> Dict[str, Any]:
     prompt = build_retrieval_prompt(q, top_k=getattr(data, 'top_k', 10) or 10)
     # Also provide baseline keywords we computed locally (optional)
     try:
-        kw_pairs = KW_MODEL.extract_keywords(q, keyphrase_ngram_range=(1, 2), stop_words='english')
+        kw_pairs = KW_MODEL.extract_keywords(
+            q, keyphrase_ngram_range=(1, 2), stop_words='english')
         keywords = [kw for kw, _ in kw_pairs]
     except Exception:
         keywords = []
@@ -1113,7 +1530,8 @@ def search_with_vector_plan(plan: VectorPlan) -> Dict[str, Any]:
         q_filter = None
         if plan.keywords:
             try:
-                q_filter = Filter(must=[FieldCondition(key="keywords", match=MatchAny(any=plan.keywords))])
+                q_filter = Filter(must=[FieldCondition(
+                    key="keywords", match=MatchAny(any=plan.keywords))])
             except Exception:
                 q_filter = None
 
@@ -1138,7 +1556,7 @@ def search_with_vector_plan(plan: VectorPlan) -> Dict[str, Any]:
             except Exception as ex:
                 print("Vector result formatting error:", ex)
                 continue
-        
+
         return {
             "results": items,
             "embedding_text": plan.embedding_text,
@@ -1227,7 +1645,8 @@ def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
     }
 
     # 5️⃣ Aggregate stats by city and measurement (group by both)
-    merged_stats = defaultdict(lambda: {"area": "", "measurement_sqft": None, "amounts": [], "count": 0})
+    merged_stats = defaultdict(
+        lambda: {"area": "", "measurement_sqft": None, "amounts": [], "count": 0})
 
     for item in items:
         norm_area = canonicalize_city(item.get("area"))
@@ -1245,7 +1664,8 @@ def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
             measurement = None
 
         # Create unique key for city + measurement combination
-        measurement_key = round(measurement, 2) if measurement is not None else None
+        measurement_key = round(
+            measurement, 2) if measurement is not None else None
         group_key = f"{cluster_rep}_{measurement_key}"
 
         ms = merged_stats[group_key]
@@ -1258,7 +1678,8 @@ def get_filtered_stats(data: FilteredSearchQuery) -> Dict[str, Any]:
     # 6️⃣ Final list: grouped by city and measurement
     final_area_stats: List[Dict[str, Any]] = []
     for g in merged_stats.values():
-        valid_amounts = [a for a in g["amounts"] if isinstance(a, (int, float))]
+        valid_amounts = [a for a in g["amounts"]
+                         if isinstance(a, (int, float))]
         if not valid_amounts:
             continue
 
@@ -1301,11 +1722,11 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
 
         if data_dict.get("item_name"):
             filters.append(FieldCondition(
-                key="item_name", match=MatchValue(value=data_dict["item_name"]) 
+                key="item_name", match=MatchValue(value=data_dict["item_name"])
             ))
         if data_dict.get("city"):
             filters.append(FieldCondition(
-                key="area", match=MatchValue(value=data_dict["city"]) 
+                key="area", match=MatchValue(value=data_dict["city"])
             ))
         measurement = data_dict.get("measurement")
         if measurement is not None:
@@ -1313,7 +1734,7 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
             # This allows for slight variations in measurement values
             tolerance = measurement * 0.1  # 10% tolerance
             filters.append(FieldCondition(
-                key="measurement_sqft", 
+                key="measurement_sqft",
                 range=Range(
                     gte=measurement - tolerance,
                     lte=measurement + tolerance
@@ -1393,8 +1814,9 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
     # 8️⃣ Aggregate stats based on grouping strategy
     if has_measurement_filter:
         # Group by city + measurement when measurement filter is provided
-        merged_stats = defaultdict(lambda: {"area": "", "measurement_sqft": None, "amounts": [], "count": 0})
-        
+        merged_stats = defaultdict(
+            lambda: {"area": "", "measurement_sqft": None, "amounts": [], "count": 0})
+
         for item in items:
             norm_area = canonicalize_city(item.get("area"))
             cluster_rep = member_to_cluster.get(norm_area, norm_area)
@@ -1411,7 +1833,8 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
                 measurement = None
 
             # Create unique key for city + measurement combination
-            measurement_key = round(measurement, 2) if measurement is not None else None
+            measurement_key = round(
+                measurement, 2) if measurement is not None else None
             group_key = f"{cluster_rep}_{measurement_key}"
 
             ms = merged_stats[group_key]
@@ -1422,8 +1845,9 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
             ms["count"] += 1
     else:
         # Group by city only when no measurement filter
-        merged_stats = defaultdict(lambda: {"area": "", "amounts": [], "count": 0})
-        
+        merged_stats = defaultdict(
+            lambda: {"area": "", "amounts": [], "count": 0})
+
         for item in items:
             norm_area = canonicalize_city(item.get("area"))
             cluster_rep = member_to_cluster.get(norm_area, norm_area)
@@ -1442,7 +1866,8 @@ def get_filtered_stats_only(data: FilteredSearchQuery) -> Dict[str, Any]:
     # 9️⃣ Final list based on grouping strategy
     final_area_stats: List[Dict[str, Any]] = []
     for g in merged_stats.values():
-        valid_amounts = [a for a in g["amounts"] if isinstance(a, (int, float))]
+        valid_amounts = [a for a in g["amounts"]
+                         if isinstance(a, (int, float))]
         if not valid_amounts:
             continue
 
@@ -1760,14 +2185,14 @@ def search_multilingual(data: MultilingualSearchQuery):
             source_lang=data.source_language,
             target_lang=data.target_language
         )
-        
+
         translated_query = translation_result["translated_query"]
         detected_language = translation_result["detected_language"]
         confidence = translation_result.get("confidence", 0.0)
-        
+
         # Perform vector search with translated query
         vector = MODEL.encode(translated_query).tolist()
-        
+
         if data.page is None or data.page_size is None:
             result = client.search(
                 collection_name=COLLECTION_NAME,
@@ -1784,7 +2209,7 @@ def search_multilingual(data: MultilingualSearchQuery):
                 limit=page_size,
                 offset=offset
             )
-        
+
         items = []
         for r in result:
             try:
@@ -1798,7 +2223,7 @@ def search_multilingual(data: MultilingualSearchQuery):
             except Exception as e:
                 print(f"Error processing item: {e}")
                 continue
-        
+
         return MultilingualSearchResponse(
             original_query=data.query,
             translated_query=translated_query,
@@ -1809,7 +2234,7 @@ def search_multilingual(data: MultilingualSearchQuery):
             page_size=data.page_size,
             translation_confidence=confidence
         )
-        
+
     except Exception as e:
         print(f"Error in multilingual search: {e}")
         return MultilingualSearchResponse(
@@ -1838,7 +2263,7 @@ def search_multilingual_nlp(data: MultilingualSearchQuery):
         # Use the existing NLP search logic with the (pre)translated query
         nlp_data = NLPSearchQuery(query=translated_query, use_nlp=data.use_nlp)
         nlp_result = search_with_nlp(nlp_data)
-        
+
         return MultilingualSearchResponse(
             original_query=data.query,
             translated_query=translated_query,
@@ -1847,7 +2272,7 @@ def search_multilingual_nlp(data: MultilingualSearchQuery):
             total_found=nlp_result.get("total_found", 0),
             translation_confidence=confidence
         )
-        
+
     except Exception as e:
         print(f"Error in multilingual NLP search: {e}")
         return MultilingualSearchResponse(
@@ -1872,15 +2297,16 @@ def search_multilingual_vector(data: MultilingualSearchQuery):
             source_lang=data.source_language,
             target_lang=data.target_language
         )
-        
+
         translated_query = translation_result["translated_query"]
         detected_language = translation_result["detected_language"]
         confidence = translation_result.get("confidence", 0.0)
-        
+
         # Use the existing vector search logic with translated query
-        vector_data = NLPSearchQuery(query=translated_query, use_nlp=data.use_nlp)
+        vector_data = NLPSearchQuery(
+            query=translated_query, use_nlp=data.use_nlp)
         vector_result = search_with_vector_similarity(vector_data)
-        
+
         return MultilingualSearchResponse(
             original_query=data.query,
             translated_query=translated_query,
@@ -1889,7 +2315,7 @@ def search_multilingual_vector(data: MultilingualSearchQuery):
             total_found=vector_result.get("total_found", 0),
             translation_confidence=confidence
         )
-        
+
     except Exception as e:
         print(f"Error in multilingual vector search: {e}")
         return MultilingualSearchResponse(
@@ -1961,7 +2387,7 @@ def get_db_items():
     rows = fetch_data()
     items = []
     for row in rows:
-        estimator_id, room_name, item_name, item_id, amount, area, project_name, attributes, item_identifier, user_id, image = row
+        estimator_id, room_name, item_name, item_id, amount, area, project_name, attributes, item_type_identifier, item_identifier, user_id, image = row
         parsed_attrs = parse_item_attributes(attributes)
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
@@ -1976,6 +2402,7 @@ def get_db_items():
             "attributes": attributes,
             "attributes_parsed": parsed_attrs,
             "measurement_sqft": measurement_sqft,
+            "item_type_identifier": item_type_identifier,
             "item_identifier": item_identifier,
             "user_id": user_id,
             "image": image
@@ -2016,16 +2443,16 @@ def insert_single_item(data: InsertItemRequest):
         # Create text for vector encoding
         text = f"{data.item_name} in {data.room_name} of {data.project_name}, located at {data.area}"
         vector = MODEL.encode(text).tolist()
-        
+
         # Parse attributes if provided
         parsed_attrs = {}
         if data.attributes:
             parsed_attrs = parse_item_attributes(data.attributes)
-        
+
         # Calculate measurement
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
-        
+
         # Calculate amount if missing/null using AmountCalculatorUtils
         amount_to_store = data.amount
         try:
@@ -2043,19 +2470,21 @@ def insert_single_item(data: InsertItemRequest):
                     elif "OTH" in data.item_identifier:
                         type_identifier = "OTH"
                 if type_identifier:
-                    dummy_item = type("Item", (), {"attributes": data.attributes})()
-                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    dummy_item = type(
+                        "Item", (), {"attributes": data.attributes})()
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(
+                        type_identifier, dummy_item)
                     if calculated_amount and calculated_amount > 0:
                         amount_to_store = calculated_amount
         except Exception:
             # Swallow calculation errors and fall back to original amount
             pass
-        
+
         # Prepare image data
         image_data = data.image
         if isinstance(image_data, dict) and "default" in image_data:
             image_data = image_data["default"]
-        
+
         # Insert into Qdrant
         client.upsert(
             collection_name=COLLECTION_NAME,
@@ -2075,19 +2504,20 @@ def insert_single_item(data: InsertItemRequest):
                         "measurement_sqft": measurement_sqft,
                         "id": data.item_id,
                         "item_identifier": data.item_identifier,
+                        "item_type_identifier": data.item_type_identifier,
                         "user_id": data.user_id,
                         "image": image_data
                     }
                 }
             ]
         )
-        
+
         return InsertResponse(
             status="success",
             inserted_count=1,
             success_ids=[data.item_id]
         )
-        
+
     except Exception as e:
         return InsertResponse(
             status="error",
@@ -2104,52 +2534,43 @@ def insert_multiple_items(data: InsertItemsRequest):
     """
     success_ids = []
     errors = []
-    
+
     for item_data in data.items:
         try:
             # Create text for vector encoding
             text = f"{item_data.item_name} in {item_data.room_name} of {item_data.project_name}, located at {item_data.area}"
             vector = MODEL.encode(text).tolist()
-            
+
             # Parse attributes if provided
             parsed_attrs = {}
             if item_data.attributes:
                 parsed_attrs = parse_item_attributes(item_data.attributes)
-            
+
             # Calculate measurement
             measurement = parsed_attrs.get("Measurement")
             measurement_sqft = measurement_to_sqft(measurement)
-            
+
             # Calculate amount if missing/null using AmountCalculatorUtils
             amount_to_store = item_data.amount
             try:
                 if not amount_to_store or amount_to_store == 0:
-                    type_identifier = None
-                    if isinstance(item_data.item_identifier, str):
-                        if "WD" in item_data.item_identifier:
-                            type_identifier = "WD"
-                        elif "FC" in item_data.item_identifier:
-                            type_identifier = "FC"
-                        elif "ACS" in item_data.item_identifier:
-                            type_identifier = "ACS"
-                        elif "LF" in item_data.item_identifier:
-                            type_identifier = "LF"
-                        elif "OTH" in item_data.item_identifier:
-                            type_identifier = "OTH"
-                    if type_identifier:
-                        dummy_item = type("Item", (), {"attributes": item_data.attributes})()
-                        calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                    item_type_identifier = item_data.item_type_identifier
+                    if isinstance(item_data.item_identifier, str) and item_type_identifier:
+                        dummy_item = type(
+                            "Item", (), {"attributes": item_data.attributes})()
+                        calculated_amount = AmountCalculatorUtils.calc_item_amount(
+                            item_type_identifier, dummy_item)
                         if calculated_amount and calculated_amount > 0:
                             amount_to_store = calculated_amount
             except Exception:
                 # Swallow calculation errors and fall back to original amount
                 pass
-            
+
             # Prepare image data
             image_data = item_data.image
             if isinstance(image_data, dict) and "default" in image_data:
                 image_data = image_data["default"]
-            
+
             # Insert into Qdrant
             client.upsert(
                 collection_name=COLLECTION_NAME,
@@ -2169,18 +2590,19 @@ def insert_multiple_items(data: InsertItemsRequest):
                             "measurement_sqft": measurement_sqft,
                             "id": item_data.item_id,
                             "item_identifier": item_data.item_identifier,
+                            "item_type_identifier": item_data.item_type_identifier,
                             "user_id": item_data.user_id,
                             "image": image_data
                         }
                     }
                 ]
             )
-            
+
             success_ids.append(item_data.item_id)
-            
+
         except Exception as e:
             errors.append(f"Item {item_data.item_id}: {str(e)}")
-    
+
     return InsertResponse(
         status="success" if not errors else "partial_success",
         inserted_count=len(success_ids),
@@ -2198,53 +2620,46 @@ def insert_batch_items(data: InsertItemsRequest):
         points = []
         success_ids = []
         errors = []
-        
+
         for item_data in data.items:
             try:
                 # Create text for vector encoding
                 text = f"{item_data.item_name} in {item_data.room_name} of {item_data.project_name}, located at {item_data.area}"
                 vector = MODEL.encode(text).tolist()
-                
+
                 # Parse attributes if provided
                 parsed_attrs = {}
                 if item_data.attributes:
                     parsed_attrs = parse_item_attributes(item_data.attributes)
-                
+
                 # Calculate measurement
                 measurement = parsed_attrs.get("Measurement")
                 measurement_sqft = measurement_to_sqft(measurement)
-                
+
                 # Calculate amount if not provided
                 amount_to_store = item_data.amount
                 if not amount_to_store or amount_to_store == 0:
                     try:
                         type_identifier = None
-                        if item_data.item_identifier:
-                            if "WD" in item_data.item_identifier:
-                                type_identifier = "WD"
-                            elif "FC" in item_data.item_identifier:
-                                type_identifier = "FC"
-                            elif "ACS" in item_data.item_identifier:
-                                type_identifier = "ACS"
-                            elif "LF" in item_data.item_identifier:
-                                type_identifier = "LF"
-                            elif "OTH" in item_data.item_identifier:
-                                type_identifier = "OTH"
-                        
+                        if item_data.item_type_identifier:
+                            type_identifier = item_data.item_type_identifier
+
                         if type_identifier and item_data.attributes:
-                            dummy_item = type("Item", (), {"attributes": item_data.attributes})()
-                            calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                            dummy_item = type(
+                                "Item", (), {"attributes": item_data.attributes})()
+                            calculated_amount = AmountCalculatorUtils.calc_item_amount(
+                                type_identifier, dummy_item)
                             if calculated_amount and calculated_amount > 0:
                                 amount_to_store = calculated_amount
                     except Exception:
                         # Swallow calculation errors and fall back to original amount
                         pass
-                
+
                 # Prepare image data
                 image_data = item_data.image
                 if isinstance(image_data, dict) and "default" in image_data:
                     image_data = image_data["default"]
-                
+
                 # Prepare point for batch insert
                 points.append({
                     "id": item_data.item_id,
@@ -2261,30 +2676,31 @@ def insert_batch_items(data: InsertItemsRequest):
                         "measurement_sqft": measurement_sqft,
                         "id": item_data.item_id,
                         "item_identifier": item_data.item_identifier,
+                        "item_type_identifier": item_data.item_type_identifier,
                         "user_id": item_data.user_id,
                         "image": image_data
                     }
                 })
-                
+
                 success_ids.append(item_data.item_id)
-                
+
             except Exception as e:
                 errors.append(f"Item {item_data.item_id}: {str(e)}")
-        
+
         # Batch insert all points at once
         if points:
             client.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points
             )
-        
+
         return InsertResponse(
             status="success" if not errors else "partial_success",
             inserted_count=len(success_ids),
             errors=errors,
             success_ids=success_ids
         )
-        
+
     except Exception as e:
         return InsertResponse(
             status="error",
@@ -2318,46 +2734,37 @@ def update_item(item_id: int, data: InsertItemRequest):
         # Create text for vector encoding
         text = f"{data.item_name} in {data.room_name} of {data.project_name}, located at {data.area}"
         vector = MODEL.encode(text).tolist()
-        
+
         # Parse attributes if provided
         parsed_attrs = {}
         if data.attributes:
             parsed_attrs = parse_item_attributes(data.attributes)
-        
+
         # Calculate measurement
         measurement = parsed_attrs.get("Measurement")
         measurement_sqft = measurement_to_sqft(measurement)
-        
+
         # Calculate amount if missing/null using AmountCalculatorUtils
         amount_to_store = data.amount
         try:
             if not amount_to_store or amount_to_store == 0:
-                type_identifier = None
-                if isinstance(data.item_identifier, str):
-                    if "WD" in data.item_identifier:
-                        type_identifier = "WD"
-                    elif "FC" in data.item_identifier:
-                        type_identifier = "FC"
-                    elif "ACS" in data.item_identifier:
-                        type_identifier = "ACS"
-                    elif "LF" in data.item_identifier:
-                        type_identifier = "LF"
-                    elif "OTH" in data.item_identifier:
-                        type_identifier = "OTH"
-                if type_identifier:
-                    dummy_item = type("Item", (), {"attributes": data.attributes})()
-                    calculated_amount = AmountCalculatorUtils.calc_item_amount(type_identifier, dummy_item)
+                item_type_identifier = data.item_type_identifier
+                if item_type_identifier:
+                    dummy_item = type(
+                        "Item", (), {"attributes": data.attributes})()
+                    calculated_amount = AmountCalculatorUtils.calc_item_amount(
+                        item_type_identifier, dummy_item)
                     if calculated_amount and calculated_amount > 0:
                         amount_to_store = calculated_amount
         except Exception:
             # Swallow calculation errors and fall back to original amount
             pass
-        
+
         # Prepare image data
         image_data = data.image
         if isinstance(image_data, dict) and "default" in image_data:
             image_data = image_data["default"]
-        
+
         # Update in Qdrant (upsert will update if exists, insert if not)
         client.upsert(
             collection_name=COLLECTION_NAME,
@@ -2377,14 +2784,15 @@ def update_item(item_id: int, data: InsertItemRequest):
                         "measurement_sqft": measurement_sqft,
                         "id": item_id,
                         "item_identifier": data.item_identifier,
+                        "item_type_identifier": data.item_type_identifier,
                         "user_id": data.user_id,
                         "image": image_data
                     }
                 }
             ]
         )
-        
+
         return {"status": "success", "message": f"Item {item_id} updated successfully"}
-        
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
